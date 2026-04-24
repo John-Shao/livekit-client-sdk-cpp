@@ -231,9 +231,30 @@ ssh rv1126b-board 'sh /tmp/phase0-collect-board.sh' > phase0-board.log
 
 SSH 连接信息已存记忆 `reference_vm_ssh.md` 的姐妹篇理论上该补一条 board 的 —— 见下一 commit。
 
+### [13] 线 B 扩展扫描（Phase 1 前置）
+
+在基础采集之外再做 10 项 livekit-相关深挖（GStreamer 插件 / V4L2 摄像头格式 / ALSA codec / Weston 状态 / libc 精确版本 / listening 端口 / MPP 测试工具 / GPU-Mesa / 外网 DNS / 内核 CONFIG 抽样）。
+
+```bash
+ssh rv1126b-board 'bash -s' < <scan-script> > phase0-board-extended.log
+```
+
+结果整理进 [facts.md](facts.md) §2.7（10 大项结论） + §2.8（Phase 1 决策总表 6 条）。原始 log 本地保留，未入 git。
+
+**几条决定性结论**（直接塑形 Phase 1 蓝图）：
+
+| 问题 | 先验假设 | 实测颠覆/确认 |
+|---|---|---|
+| 是否走 GStreamer 做视频管线？ | 可能走 | **不走** —— 板上无 Rockchip GStreamer 插件，直接 `librockchip_mpp` |
+| 是否能用 Mali EGL 渲染？ | 可能能 | **不能** —— 无 `libmali*`，走 DRM/KMS planes |
+| webrtc-sys 选 OpenSSL 还是 BoringSSL？ | 待定 | **OpenSSL 3.x**（板上 `libssl.so.3`） |
+| 零拷贝通路？ | 可能用 dmabuf heaps | **不是** —— `/dev/dma_heaps/` 缺失，走 CMA / V4L2 DMABUF |
+| `mpi_enc_test` 可否直接 smoke？ | 未知 | **可以** —— 板上 `/usr/bin/mpi_{enc,dec}*_test` 齐全 |
+| 摄像头工作吗？ | 未知 | **工作** —— `rkisp_v11` + 默认 640×480 NV16 |
+
 ### [待办] Build 完成后回收
 
 1. `tail -100 build-*.log` 贴回确认成功或截取最后错误
 2. `ls buildroot/output/rockchip_rv1126b/host/usr/bin/aarch64-buildroot-linux-gnu-*` 确认 toolchain 生成
 3. 用新 toolchain 重跑 `./scripts/phase0-collect-host.sh`，填 facts.md §1.1/§1.2/§4 最终值
-4. 板子到位后进线 B（Phase 0 板端采集）
+4. 用 `mpi_enc_test` + 摄像头采帧跑一次硬件 smoke，验证 Phase 1 基线

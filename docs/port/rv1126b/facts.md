@@ -136,7 +136,80 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 - `mpp_worker_0/1/2`（MPP 内核端工作线程）
 - `irq/64-rga2`（RGA2 IRQ 处理）
 
-这说明：出厂固件**没有自启任何媒体应用**，PID 名空间干净，后续 livekit 启动不会与系统服务冲突。
+**注意**：§2.7 扩展扫描显示用户态实际有若干服务已在跑（rkaiq_3A_server、nginx、vsftpd、connmand、rpcbind 等），见下。
+
+### 2.7 扩展扫描（Phase 1 决策输入）
+
+采集方式：`ssh rv1126b-board 'bash -s'` + 临时扫描脚本，时间 2026-04-24T18:55；原始 192 行输出保存在 `phase0-board-extended.log`（git 未追踪）。下面只保留结论。
+
+**(a) GStreamer**
+- `gst-launch-1.0` 可用；`gst-inspect-1.0` 中**无 Rockchip HW-accel 一方插件**（`mppvideodec`/`mppvideoenc`/`rgasrc`/`kmssink`/`waylandsink` 均不存在）
+- 仅 `video4linux2` + `libav`（ffmpeg 后端）+ 基础 typefind
+- 结论：livekit 视频编解码走 `librockchip_mpp` 直接调用，不依赖 GStreamer
+
+**(b) V4L2 / 摄像头**
+- 摄像头已接入且活跃：`rkisp_mainpath`（`/dev/video-camera0` → `video23`）
+- 默认采集格式：**640×480 NV16** (4:2:2)，可通过 `v4l2-ctl --set-fmt` 调高
+- 驱动：`rkisp_v11` 3.2.0，Media 6.1.141
+- ISP 拓扑：`rkaiisp` + `rkisp-statistics` + `rkcif-mipi-lvds*`（11 个 cif 节点）
+- 用户态 AE/AWB/AF 服务 `rkaiq_3A_server` 已在 `127.0.0.1:4894` 监听
+
+**(c) ALSA 音频**
+- Card 0：`rockchipes8390` + **ES8389 codec**（硬件 IC）
+- 同一 card 同时支持 playback + capture（headset codec 架构）
+- 结论：livekit audio in/out 可直接用 `plughw:0,0`，无需 PulseAudio
+
+**(d) Weston / 显示**
+- `/usr/bin/weston` 已安装，但**未自启**（无 systemd service；`/proc/fb` 显示 `rockchipdrmfb`）
+- 决策点：livekit 要么起 Weston 合成，要么直接 KMS+DRM planes 自管显示 —— Phase 3 渲染方案待定
+
+**(e) libc 精确版本**
+- **glibc 2.41**（Buildroot 2024.02 stable，2025 Copyright）
+- 后续 VM toolchain `aarch64-buildroot-linux-gnu-gcc` 的 sysroot 必须对齐 glibc 2.41，否则运行时 `GLIBC_2.xx` 符号找不到
+
+**(f) 监听端口（`ss -tlnp`）**
+- `0.0.0.0:22` sshd
+- `0.0.0.0:80` nginx（出厂 IPC web UI）
+- `0.0.0.0:21` vsftpd（FTP —— 安全上建议后续关）
+- `0.0.0.0:111` rpcbind + rpc.mountd/statd（NFS client）
+- `127.0.0.1:53` connmand DNS stub
+- `127.0.0.1:4894` `rkaiq_3A_server`
+- 与 livekit 默认端口（7880 ws、RTP/UDP 动态）**无冲突**
+
+**(g) MPP / RGA 测试二进制**（`/usr/bin/` 下齐全）
+- `mpi_enc_test` / `mpi_enc_mt_test` / `mpi_rc2_test` —— 硬件编码 smoke test
+- `mpi_dec_test` / `mpi_dec_mt_test` / `mpi_dec_multi_test` / `mpi_dec_nt_test` —— 硬件解码 smoke test
+- **Phase 1 可以先用这些做硬件 smoke，再开始 livekit 集成**
+
+**(h) GPU / Mesa**
+- `libEGL.so.1` + `libGLESv{1_CM,2}.so` + `libgbm.so.1.0.0` + `libdrm.so.2.124.0` 都在
+- **无 `libmali*`** —— RV1126B 当前档位**无 Mali 3D GPU**（或驱动未装），Weston 只能走软渲 (llvmpipe) 或纯 2D VOP 合成
+- 结论：Phase 3 本地预览**优先走 DRM/KMS plane 直给**，避免 GLES 软渲染吃 CPU
+
+**(i) 外网 / DNS**
+- `1.1.1.1` ping RTT 75ms（WiFi → 公网）
+- `www.livekit.io` DNS 能解析（connman stub + 上游 DNS OK）
+- TLS 证书校验所需的系统时间准确性已在 §2.5 确认
+
+**(j) 内核 CONFIG 抽样**（`/proc/config.gz` 可读）
+- `CONFIG_V4L2_MEM2MEM_DEV=y` ✓
+- `CONFIG_VIDEO_ROCKCHIP_ISP=y` + V1X/V21/V30/V32/V35/V39 全版本
+- `CONFIG_VIDEO_ROCKCHIP_ISPP=y`（ISP 后处理）
+- `CONFIG_VIDEO_ROCKCHIP_RGA=y`（V4L2-M2M RGA）
+- `CONFIG_ROCKCHIP_RGA=n` 但 `CONFIG_VIDEO_ROCKCHIP_RGA=y`：`/dev/rga` (10:124) 来自 V4L2-M2M 路径
+- `CONFIG_ROCKCHIP_MPP_SERVICE=y`（mpp_service 驱动）
+- `CONFIG_ROCKCHIP_DRM_TVE=y`（TV 编码器，本板无用）
+
+### 2.8 扩展扫描 → Phase 1 影响总表
+
+| 决策点 | 基于事实 | 倾向结论 |
+|---|---|---|
+| 视频编解码通路 | GStreamer 无 mpp 插件；`/usr/bin/mpi_enc_test` 齐全 | 直调 `librockchip_mpp`，不绕 GStreamer |
+| 渲染通路 | 无 Mali GPU；DRM + libdrm + KMS 可用 | DRM/KMS planes 直接 overlay，免 EGL |
+| 音频通路 | ES8389 单卡双向 | ALSA `plughw:0,0`，无需 PulseAudio |
+| TLS | OpenSSL 3.x on board + glibc 2.41 | webrtc-sys 选 OpenSSL 分支（非 BoringSSL） |
+| 零拷贝 | 无 `/dev/dma_heaps/`，有 `/dev/rga` + MPP + V4L2-M2M | Rockchip CMA 或 V4L2 DMABUF export，不用 dmabuf heaps |
+| 相机 | rkisp_v11 + rkaiq_3A_server running | 走标准 V4L2 capture，不需额外 ISP 初始化 |
 
 ## 3. webrtc-sys pinned 版本（Phase 1 决策直接输入）
 

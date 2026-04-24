@@ -29,27 +29,30 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 - `-print-sysroot`：`.../aarch64-none-linux-gnu/libc/`（内含 `usr/lib64/libstdc++.so.6`，**其他库全缺**）
 - **不用于** 编译 livekit 用户态代码（该 sysroot 只够 kernel/u-boot 自举，不含 OpenSSL/ALSA/libudev/MPP/RGA）
 
-**(b) Buildroot host toolchain**（livekit 交叉编译用此套）
-- 路径：`$SDK_ROOT/buildroot/output/rockchip_rv1126b/host/usr/bin/`（<!-- TODO 确认 defconfig 名 -->）
+**(b) Buildroot host toolchain**（livekit 交叉编译用此套 — 已就位）
+- 路径：`$SDK_ROOT/buildroot/output/alientek_rv1126b/host/usr/bin/` ✓
+  （注意：目录名是 Buildroot defconfig `alientek_rv1126b`，**不是** `rockchip_rv1126b`）
 - 前缀：`aarch64-buildroot-linux-gnu-`
-- GCC 版本：<!-- TODO 从 phase0-host.log 填 -->
-- `-dumpmachine`：<!-- TODO -->
-- `-print-sysroot`：<!-- TODO -->
-- `-print-libgcc-file-name`：<!-- TODO -->
-- 前提：Buildroot 需先至少构建一次（`make rockchip_rv1126b_defconfig && make`）
+- GCC 版本：**13.4.0**（Buildroot `-g4a1fe4ec`）
+- `-dumpmachine`：`aarch64-buildroot-linux-gnu`
+- `-print-sysroot`：`$SDK_ROOT/buildroot/output/alientek_rv1126b/host/aarch64-buildroot-linux-gnu/sysroot`
+- Sysroot 体积：**1.2 GiB**
+- 版本哈希 `-g4a1fe4ec` **完全对齐**板上 `/etc/os-release` 的 `VERSION=-g4a1fe4ec`，即此 toolchain 编出的 binary 直接匹配板上 rootfs ABI
+- 构建耗时参考：首次 `./build.sh` 全量 ≈ 1h51min（从 `./build.sh lunch` 到 `rootfs succeeded`）
 
-### 1.2 Sysroot 关键库清单
+### 1.2 Sysroot 关键库清单（`.../host/aarch64-buildroot-linux-gnu/sysroot/usr/lib/`）
 
-| 库 | 是否存在 | .so 路径 | .pc 路径 |
+| 库 | 是否存在 | .so 路径（相对 sysroot） | .pc 文件 |
 |---|---|---|---|
-| libssl | <!-- TODO --> |  |  |
-| libcrypto | <!-- TODO --> |  |  |
-| libasound | <!-- TODO --> |  |  |
-| libv4l | <!-- TODO --> |  |  |
-| libudev | <!-- TODO --> |  |  |
-| librockchip_mpp | <!-- TODO --> |  |  |
-| librga | <!-- TODO --> |  |  |
-| libstdc++ | <!-- TODO --> |  |  |
+| libssl | ✓ | `usr/lib/libssl.so.3` | `usr/lib/pkgconfig/libssl.pc` |
+| libcrypto | ✓ | `usr/lib/libcrypto.so.3` (+ `libcrypto.a`) | `usr/lib/pkgconfig/libcrypto.pc` |
+| libasound | ✓ | `usr/lib/libasound.so.2` | 预期存在 |
+| libv4l | <!-- TODO 未显式验证，后续链 livekit 时若需再查 --> |  |  |
+| libudev | <!-- TODO 未显式验证 --> |  |  |
+| librockchip_mpp | ✓ | `usr/lib/librockchip_mpp.so.{0,1}` (+ `.a`) | 预期存在 |
+| librga | ✓ | `usr/lib/librga.so.2.1.0` (+ `.a`) | `usr/lib/pkgconfig/librga.pc` |
+| libstdc++ | ✓ | `usr/lib/libstdc++.a` / `.so.6.0.32` | — |
+| libc | ✓ | `usr/lib/libc.so.6` | — |
 
 ### 1.3 SDK 源码位置（sync 后已确认存在 ✓）
 

@@ -252,9 +252,26 @@ ssh rv1126b-board 'bash -s' < <scan-script> > phase0-board-extended.log
 | `mpi_enc_test` 可否直接 smoke？ | 未知 | **可以** —— 板上 `/usr/bin/mpi_{enc,dec}*_test` 齐全 |
 | 摄像头工作吗？ | 未知 | **工作** —— `rkisp_v11` + 默认 640×480 NV16 |
 
-### [待办] Build 完成后回收
+### [14] 线 A — Buildroot 全量构建完成
 
-1. `tail -100 build-*.log` 贴回确认成功或截取最后错误
-2. `ls buildroot/output/rockchip_rv1126b/host/usr/bin/aarch64-buildroot-linux-gnu-*` 确认 toolchain 生成
-3. 用新 toolchain 重跑 `./scripts/phase0-collect-host.sh`，填 facts.md §1.1/§1.2/§4 最终值
-4. 用 `mpi_enc_test` + 摄像头采帧跑一次硬件 smoke，验证 Phase 1 基线
+**耗时 1h51min**（起 16:43 终 18:34），比预期的 2–4h 快。通过 `ssh rv1126b-vm` 远程巡检（见 `reference_vm_ssh.md`）确认：
+
+- Toolchain：`buildroot/output/alientek_rv1126b/host/usr/bin/aarch64-buildroot-linux-gnu-gcc` = **13.4.0** (Buildroot `-g4a1fe4ec`)
+- 关键：目录名是 `alientek_rv1126b`（Buildroot defconfig 名），不是 `rockchip_rv1126b`（我之前脚本里猜的路径）。改 `scripts/phase0-collect-host.sh` 的 Toolchain fallback 可以把 `rockchip_rv1126b` 换成从 `device/rockchip/.chip/*.chipconfig` 读取 `RK_BUILDROOT_CFG`，不过 Phase 0 已收尾，不动了。
+- Sysroot (1.2 GiB)：`libssl.so.3` / `libcrypto.so.3` / `librockchip_mpp.so.{0,1}` / `librga.so.2.1.0` / `libasound.so.2` / `libstdc++.so.6.0.32` 全在
+- **ABI 闭环**：toolchain 版本 hash `-g4a1fe4ec` 与板上 `/etc/os-release` 的 `VERSION=-g4a1fe4ec` 完全相等，VM 编出的 livekit 可直接推到板上跑，无 ABI 偏移
+- Firmware 产物就绪（`output/firmware/`）：`boot.img` / `rootfs.img` (→`rootfs.ext2` 1.3G) / `uboot.img` / `MiniLoaderAll.bin` / `misc.img`
+- 可选 rootfs 格式（`buildroot/output/alientek_rv1126b/images/`）：`rootfs.squashfs` (460M，紧凑) / `rootfs.ext2` (1.3G) / `rootfs.cpio.gz` (463M) / `rootfs.tar` (1.1G)
+
+`facts.md` §1.1 (toolchain)、§1.2 (sysroot) 已填完最终值。
+
+### Phase 0 正式收尾
+
+所有 §1 主机侧、§2 板端、§4 rootfs 决策事实已固化。剩余 §3 webrtc-sys pinned 版本留给 Phase 1 决策时查代码时填（需读 `client-sdk-rust/webrtc-sys/libwebrtc/build.rs`）。
+
+### [Phase 1 切入建议]
+
+1. 硬件 smoke：VM 推板端用 `mpi_enc_test` + 摄像头采帧 → 验证 H.264 硬编能 work
+2. 测 DRM/KMS plane overlay（无 Mali 无 EGL 路径），用板上现成 libdrm 写最小渲染 demo
+3. 读 `client-sdk-rust/webrtc-sys/libwebrtc/build.rs` 查 pinned libWebRTC commit，确认 aarch64 prebuilt URL 是否存在
+4. 若无 prebuilt：自建 libWebRTC aarch64 分支，用 §1.1 toolchain 编

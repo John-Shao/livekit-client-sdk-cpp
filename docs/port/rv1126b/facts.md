@@ -5,20 +5,32 @@
 
 ## 1. 主机侧（ATK SDK 构建环境）
 
-- ATK SDK 版本：<!-- TODO 例：rv1126b_linux6.1_release_v1.2.0_20251220 -->
-- SDK 根路径：<!-- TODO 例：/home/johnshao/atk-dlrv1126b-sdk -->
-- 主机 OS / GCC 版本：<!-- TODO 例：Ubuntu 22.04, gcc 11.4.0 -->
+- ATK SDK 发布包：`atk_dlrv1126b_linux6.1_sdk_release_v1.2.1_20260327.tar.gz`
+- 顶层 manifest：`rv1126b_linux6.1_release.xml` → `release/atk-dlrv1126b_linux6.1_release_v1.1.0_20260327.xml`
+- 基础 manifest：`release/rv1126b_linux6.1_release_v1.2.0_20251220.xml`（Rockchip R2 branch，tag `linux-6.1-stan-rkr7`）
+- ATK 覆写 tag：`atk-dlrv1126b-release-v1.0` / `v1.1`（覆写 buildroot、device/rockchip、u-boot、rkbin、kernel-6.1、camera_engine_rkaiq、ipc_drv_ko）
+- SDK 根路径（VM）：`/home/alientek/atk-dlrv1126b-sdk/`
+- 同步方式：`.repo/project-objects/` 本地自带（5.1GB），`./repo.sh` 仅做本地 checkout（`repo sync -l`，无需联网）
+- 主机 OS / GCC 版本：<!-- TODO 从 phase0-host.log 填 -->
 
 ### 1.1 交叉编译工具链
 
-| 项 | 值 |
-|---|---|
-| 路径（bin） | <!-- TODO 例：$SDK_ROOT/buildroot/output/rockchip_rv1126b/host/usr/bin --> |
-| 前缀 prefix | <!-- TODO 例：aarch64-buildroot-linux-gnu --> |
-| GCC 版本 | <!-- TODO 例：13.4.0 --> |
-| `-dumpmachine` | <!-- TODO 例：aarch64-buildroot-linux-gnu --> |
-| `-print-sysroot` | <!-- TODO --> |
-| `-print-libgcc-file-name` | <!-- TODO --> |
+SDK 内共有 **两套** aarch64 工具链，用途不同：
+
+**(a) Prebuilt ARM toolchain**（仅用于 kernel / u-boot / rkbin 构建）
+- 路径：`$SDK_ROOT/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/`
+- 前缀：`aarch64-none-linux-gnu-`（bare-metal 三元组，无 sysroot 绑定）
+- GCC 版本：10.3.1（ARM 发布）
+- **不用于** 编译 livekit 用户态代码（glibc 版本可能与 rootfs 不匹配）
+
+**(b) Buildroot host toolchain**（livekit 交叉编译用此套）
+- 路径：`$SDK_ROOT/buildroot/output/rockchip_rv1126b/host/usr/bin/`（<!-- TODO 确认 defconfig 名 -->）
+- 前缀：`aarch64-buildroot-linux-gnu-`
+- GCC 版本：<!-- TODO 从 phase0-host.log 填 -->
+- `-dumpmachine`：<!-- TODO -->
+- `-print-sysroot`：<!-- TODO -->
+- `-print-libgcc-file-name`：<!-- TODO -->
+- 前提：Buildroot 需先至少构建一次（`make rockchip_rv1126b_defconfig && make`）
 
 ### 1.2 Sysroot 关键库清单
 
@@ -33,11 +45,20 @@
 | librga | <!-- TODO --> |  |  |
 | libstdc++ | <!-- TODO --> |  |  |
 
-### 1.3 SDK 源码位置
+### 1.3 SDK 源码位置（manifest 声明路径，sync 后出现）
 
-- MPP：<!-- TODO 例：$SDK_ROOT/external/mpp -->
-- Rockit：<!-- TODO -->
-- linux-rga：<!-- TODO -->
+| 路径 | tag | 用途（livekit 视角） |
+|---|---|---|
+| `external/mpp` | `linux-6.1-stan-rkr7.1` | H.264/H.265/AV1 硬件编解码，必用 |
+| `external/linux-rga` | `linux-6.1-stan-rkr7` | 2D 硬件加速/格式转换，备用 |
+| `external/rockit` | `rv1126b-linux-6.1-stan-rkr7` | Rockchip 媒体中间件（MPP 的高层封装），可选 |
+| `external/gstreamer-rockchip` | `linux-6.1-stan-rkr7` | 若走 GStreamer 管线集成则需要 |
+| `external/alsa-config` | `linux-6.1-stan-rkr7` | ALSA userspace 配置 |
+| `external/camera_engine_rkaiq` | `atk-dlrv1126b-release-v1.0` | 摄像头 ISP 调校，livekit 客户端一般不需要 |
+| `external/rknpu2` / `rknn-toolkit2` / `rknn-llm` | `linux-6.1-stan-rkr7` | NPU，livekit 不用 |
+| `buildroot/` | `atk-dlrv1126b-release-v1.0` | rootfs + 用户态 toolchain 生成器 |
+| `kernel-6.1/` | `atk-dlrv1126b-release-v1.1` | Linux 6.1 内核源码 |
+| `u-boot/` | `atk-dlrv1126b-release-v1.0` | bootloader |
 
 ### 1.4 Rust 环境
 
@@ -100,8 +121,12 @@
 
 ## 4. Rootfs 决策
 
-- **选定**：<!-- TODO Buildroot / Debian 12 / Yocto 5.0 -->
-- **理由**：<!-- TODO -->
+- **选定**：Buildroot（tentative，待板端实测确认）
+- **理由**：
+  - ATK 发布包默认预置 `buildroot/` 目录（`使用说明.md` 明确指示用户走 Buildroot 流程）
+  - 基础 manifest 只实际启用了 `linux6.1-rkr2`（含 `linux/buildroot`），`debian12-rkr2` 被注释掉
+  - Rockchip 同时提供 `yocto-scarthgap-release-r2`，若后续空间/依赖受限再考虑切 Yocto
+  - Debian 12 需要 ~500MB+ rootfs，对 NAND/eMMC 空间敏感的 IPC 类场景不首选
 
 ## 5. 原始收集输出（附）
 

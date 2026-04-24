@@ -74,51 +74,69 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 
 ## 2. 板端（ATK-DLRV1126B）
 
+采集时间：2026-04-24T18:36:40+08:00，采集方式：`ssh rv1126b-board` + `scripts/phase0-collect-board.sh`（见 §5）。
+
 ### 2.1 系统信息
 
 | 项 | 值 |
 |---|---|
-| `uname -m` | <!-- TODO 期望 aarch64 --> |
-| 内核 | <!-- TODO 例：Linux 6.1.x --> |
-| `/etc/os-release` NAME | <!-- TODO 期望 Buildroot 2024.02 或 Debian 12 --> |
-| libc 类型 | <!-- TODO glibc / musl --> |
-| libstdc++ 版本 | <!-- TODO 例：GLIBCXX_3.4.32 --> |
+| `uname -a` | `Linux ATK-DLRV1126B 6.1.141 #28 SMP Mon Mar 23 15:01:49 CST 2026 aarch64 GNU/Linux` |
+| 内核编译时间 | 2026-03-23 15:01 CST |
+| `/etc/os-release` | Buildroot 2024.02（`VERSION=-g4a1fe4ec`，`ID_LIKE="buildroot"`） |
+| `RK_BUILD_INFO` | `alientek@alientek Mon Mar 23 15:03:55 CST 2026 - alientek_rv1126b` —— 出厂镜像就是用 `alientek_rv1126b_defconfig` 编的 |
+| libc | **glibc**（`/lib/libc.so.6` 1.5MB + `/lib/ld-linux-aarch64.so.1`） |
+| libstdc++ | `libstdc++.so.6.0.32` → **GCC 13.x ABI**（后续 Buildroot host toolchain 要与此对齐） |
 
 ### 2.2 CPU / 内存 / 磁盘
 
 | 项 | 值 |
 |---|---|
-| CPU 型号 | <!-- TODO 例：Cortex-A53 × 4 --> |
-| CPU 频率 | <!-- TODO 例：1.9 GHz --> |
-| 内存 | <!-- TODO 例：512 MB LPDDR4X --> |
-| 根分区剩余 | <!-- TODO 例：1.2 GB --> |
+| CPU | **ARM Cortex-A53**（`CPU part 0xd03`），4 核（dmesg/ps 显示 mpp_worker 0-2 + 主核 = 4） |
+| CPU features | `fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid` —— **硬件 AES/PMULL/SHA 指令**可用，TLS 加速 |
+| BogoMIPS | 48（启动态，不代表峰值） |
+| 内存 | 1.9 GiB（空闲 1.5 GiB，buff/cache 312 MiB） |
+| Swap | **0**（无交换分区，运行期不能假设虚拟内存） |
+| 根分区 | `/dev/root` on `/`，5.9 GiB（已用 1.1 GiB / 19%，剩 4.6 GiB） |
 
 ### 2.3 硬件设备节点
 
 | 节点 | 存在 | 备注 |
 |---|---|---|
-| `/dev/mpp_service` | <!-- TODO y/n --> |  |
-| `/dev/rga` | <!-- TODO --> |  |
-| `/dev/dri/card0` | <!-- TODO --> |  |
-| `/dev/video*` | <!-- TODO 数量/列表 --> |  |
-| `/dev/dma_heaps/cma-uncached` | <!-- TODO --> |  |
-| `/dev/dma_heaps/system` | <!-- TODO --> |  |
+| `/dev/mpp_service` | ✓ | c 240:0，root:video rw |
+| `/dev/rkvenc*` / `/dev/rkvdec*` | ✗ | RV1126B 不暴露独立 venc/vdec 节点，统一走 mpp_service |
+| `/dev/rga` | ✓ | c 10:124 |
+| `/dev/dri/card0` | ✓ | c 226:0 |
+| `/dev/dri/renderD128` | ✓ | c 226:128（Mesa render node） |
+| `/dev/video-camera0` | ✓ | symlink → `/dev/video23` |
+| `/dev/video0..video16` | ✓ | ISP 流水线节点，合计 10+ 个 |
+| `/dev/dma_heaps/` | ✗ | **缺失**——libwebrtc 零拷贝路径若预期 `/dev/dma_heaps/{cma-uncached,system}` 需改走 Rockchip CMA allocator 或 `ION` 老接口 |
 
 ### 2.4 板端运行时库
 
-| 库 | 路径 | 版本（若可查） |
+| 库 | 路径 | 版本 |
 |---|---|---|
-| librockchip_mpp | <!-- TODO --> |  |
-| librga | <!-- TODO --> |  |
-| libasound | <!-- TODO --> |  |
-| libssl / libcrypto | <!-- TODO --> |  |
+| librockchip_mpp | `/usr/lib/librockchip_mpp.so.{0,1}` | 同时存在 .0 和 .1 两个 soname（兼容 shim） |
+| librga | `/usr/lib/librga.so.2.1.0` → `.so.2` | RGA API 2.x |
+| librockit | **未安装** | 预期，因板级选了 GStreamer 档（非 `ipc`） |
+| libasound | `/usr/lib/libasound.so` + `alsa-lib/*.so`（含 bluealsa/samplerate） | ALSA 用户态完整 |
+| libssl / libcrypto | `/usr/lib/libssl.so.3` / `libcrypto.so.3` | **OpenSSL 3.x** ✓ |
 
 ### 2.5 网络 / 时钟
 
-- 网卡 IP：<!-- TODO -->
-- 默认网关：<!-- TODO -->
-- 系统时间准确：<!-- TODO y/n，若 n 需 ntpdate -->
-- LiveKit server 可达性：<!-- TODO 待 Phase 5 测 -->
+- 网卡：`wlan0` 有 IP `192.168.10.236/24`（注：板级 defconfig 设了 `RK_WIFIBT=n` 但 `alientek_rv1126b_defconfig` 里 include 了 `wifibt/wireless.config` 拉了 WiFi 用户态；RK_WIFIBT=n 只影响内核驱动/固件打包）
+- 未启用以太网口（板子或没插网线，或 DTS 没配）
+- 默认网关：`192.168.10.1 dev wlan0`
+- DNS：`nameserver ::1 / 127.0.0.1`（connman 本地 stub）
+- 系统时间：`Fri Apr 24 18:36:43 CST 2026` —— **正确**（与 NTP 或 RTC 已同步），TLS 证书校验不会挂
+- LiveKit server 可达性：未测（Phase 5 再确认）
+
+### 2.6 运行态进程
+
+板子 idle 1h22m，无用户态 MPP/RockIPC/rockit 进程运行，仅以下内核线程：
+- `mpp_worker_0/1/2`（MPP 内核端工作线程）
+- `irq/64-rga2`（RGA2 IRQ 处理）
+
+这说明：出厂固件**没有自启任何媒体应用**，PID 名空间干净，后续 livekit 启动不会与系统服务冲突。
 
 ## 3. webrtc-sys pinned 版本（Phase 1 决策直接输入）
 
@@ -166,7 +184,50 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 </details>
 
 <details>
-<summary>板端脚本输出</summary>
+<summary>板端脚本输出（MAC 地址已掩码）</summary>
+
+```
+Phase 0 板端侦察 — 2026-04-24T18:36:40+08:00
+
+=== [1] CPU / 架构 ===
+Linux ATK-DLRV1126B 6.1.141 #28 SMP Mon Mar 23 15:01:49 CST 2026 aarch64 GNU/Linux
+processor	: 0..3 (Cortex-A53, CPU part 0xd03, features: fp asimd aes pmull sha1 sha2 crc32)
+
+=== [2] OS / Rootfs ===
+NAME=Buildroot VERSION=-g4a1fe4ec ID=buildroot VERSION_ID=2024.02
+RK_BUILD_INFO="alientek@alientek Mon Mar 23 15:03:55 CST 2026 - alientek_rv1126b"
+libc: /lib/ld-linux-aarch64.so.1 (198 KB) + /lib/libc.so.6 (1.5 MB)
+libstdc++: /usr/lib/libstdc++.so.6.0.32
+
+=== [3] 内存 / 磁盘 ===
+Mem: 1.9Gi total, 1.5Gi free, 312Mi buff/cache; Swap: 0
+/dev/root on /: 5.9G size, 1.1G used, 4.6G avail (19%)
+
+=== [4] 硬件设备节点 ===
+MPP:   /dev/mpp_service (240:0)  [no rkvenc/rkvdec nodes]
+RGA:   /dev/rga (10:124)
+DRM:   /dev/dri/card0 (226:0), /dev/dri/renderD128 (226:128)
+V4L2:  /dev/video-camera0 -> video23; /dev/video0..video16 (10+ nodes)
+DMA-BUF heaps: MISSING
+
+=== [5] 用户态库 ===
+librockchip_mpp: /usr/lib/librockchip_mpp.so.{0,1}
+librga:          /usr/lib/librga.so.2.1.0, .so.2
+librockit:       (not installed)
+libasound:       /usr/lib/libasound.so + alsa-lib/{bluealsa,samplerate}
+libssl/libcrypto: /usr/lib/lib{ssl,crypto}.so.3
+
+=== [6] 网络 ===
+wlan0: 192.168.10.236/24, MAC xx:xx:xx:xx:xx:xx
+default gw 192.168.10.1 via wlan0
+DNS: ::1, 127.0.0.1 (connman stub)
+
+=== [7] 时钟 ===
+Fri Apr 24 18:36:43 CST 2026 (correct)
+
+=== [8] 进程 ===
+只有 mpp_worker_0/1/2 和 irq/64-rga2 内核线程；无用户态媒体/网络应用
+```
 
 ```
 <!-- TODO 粘贴 scripts/phase0-collect-board.sh 的完整输出 -->

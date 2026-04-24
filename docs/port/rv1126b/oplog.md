@@ -199,6 +199,38 @@ sudo apt install -y gettext
 
 **教训**：之前 [9] 的 apt 清单漏了 `gettext`，Buildroot 2024.02 的 host dep 检查会专门校验 `msgmerge`。后续若仍有缺包按错误提示逐个补即可。
 
+### [12] 线 B — 板端 Phase 0 采集
+
+板子到位后联调 SSH 免密 + 跑采集脚本。
+
+```bash
+# 1) 给板子建专用 ed25519 密钥（别和 VM/GitHub 那把混）
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_rv1126b_board -C "claude-code@rv1126b-board ..."
+# 配置 ~/.ssh/config Host alias: rv1126b-board → 192.168.10.236 (root)
+
+# 2) 用户一次性手动推公钥到板子（PowerShell 窗口，输入密码 root）
+type $env:USERPROFILE\.ssh\id_rv1126b_board.pub | ssh root@192.168.10.236 \
+  "mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
+
+# 3) 推脚本 + 采数据（此后全免密）
+scp scripts/phase0-collect-board.sh rv1126b-board:/tmp/
+ssh rv1126b-board 'sh /tmp/phase0-collect-board.sh' > phase0-board.log
+```
+
+板端侦察结果已整理进 [facts.md](facts.md) §2（§2.1–2.6），原始输出折叠在 §5。
+
+**关键发现（影响后续 Phase 1–5 决策）**：
+
+| 发现 | 影响 |
+|---|---|
+| Rootfs 标记 `RK_BUILD_INFO="alientek_rv1126b"` | 出厂固件与 VM 当前在构建的**完全同款**，VM 产物可直接烧板验证 |
+| libstdc++.so.6.0.32 → **GCC 13.x ABI** | 线 A 产出的 Buildroot toolchain ABI 必须对齐；Buildroot 2024.02 默认是 GCC 13，符合 |
+| OpenSSL **3.x** 已在 rootfs 中 | webrtc-sys 链接 boringssl vs openssl 的分叉可倒向 openssl 路径 |
+| `/dev/dma_heaps/` **缺失** | libwebrtc 零拷贝层如假设 dmabuf heaps 需改 Rockchip CMA/ION 接口，Phase 2 关注点 |
+| Swap=0 + 1.9G RAM + 4.6G 空闲 `/` | livekit + weston + qt5 + ffmpeg 运行时需 profile 内存与 rootfs 余量 |
+
+SSH 连接信息已存记忆 `reference_vm_ssh.md` 的姐妹篇理论上该补一条 board 的 —— 见下一 commit。
+
 ### [待办] Build 完成后回收
 
 1. `tail -100 build-*.log` 贴回确认成功或截取最后错误

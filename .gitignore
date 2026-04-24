@@ -31,3 +31,7 @@ lib/
 *.exe
 livekit.log
 web/
+# RV1126B port recon artifacts (raw script output; parsed facts live in docs/port/rv1126b/facts.md)
+phase0-host.log
+phase0-board.log
+.claude/scheduled_tasks.lock

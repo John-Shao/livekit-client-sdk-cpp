@@ -25,6 +25,11 @@ fi
 # PATH 前置工具链 bin
 export PATH="$ATK_TOOLCHAIN_ROOT/usr/bin:$PATH"
 
+# 确保 rustup 的 cargo/rustc 在 PATH（非交互 ssh 不会自动 source ~/.cargo/env）
+if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+
 PREFIX=aarch64-buildroot-linux-gnu
 TARGET=aarch64-unknown-linux-gnu
 

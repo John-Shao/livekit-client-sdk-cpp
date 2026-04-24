@@ -54,8 +54,13 @@ export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=$ATK_SYSROOT -I$ATK_SYSROOT/usr/inclu
 # protoc 必须是 host 版（Ubuntu 包就行）
 export PROTOC="${PROTOC:-$(command -v protoc || echo /usr/bin/protoc)}"
 
-# 如果后续要切 Phase 1 路径 ② / ③：
-# export LK_CUSTOM_WEBRTC=/path/to/local/webrtc   # 覆盖 prebuilt 下载
+# LiveKit webrtc prebuilt：若 ~/webrtc-prebuilt/linux-arm64-release/ 已存在，
+# 自动设 LK_CUSTOM_WEBRTC 绕过 webrtc-sys build.rs 的 158MB 下载（在中国到
+# release-assets.githubusercontent.com 基本拉不动，用本地 unzip 的副本最稳）。
+# 手动覆盖：先 export LK_CUSTOM_WEBRTC 再 source 本脚本。
+if [ -z "$LK_CUSTOM_WEBRTC" ] && [ -f "$HOME/webrtc-prebuilt/linux-arm64-release/lib/libwebrtc.a" ]; then
+  export LK_CUSTOM_WEBRTC="$HOME/webrtc-prebuilt/linux-arm64-release"
+fi
 
 echo "[env-rv1126b] ATK_SDK_ROOT=$ATK_SDK_ROOT"
 echo "[env-rv1126b] ATK_TOOLCHAIN_ROOT=$ATK_TOOLCHAIN_ROOT"
@@ -63,3 +68,4 @@ echo "[env-rv1126b] ATK_SYSROOT=$ATK_SYSROOT"
 echo "[env-rv1126b] gcc: $($PREFIX-gcc --version | head -1)"
 echo "[env-rv1126b] rust target: $TARGET"
 echo "[env-rv1126b] protoc: $(protoc --version 2>/dev/null || echo NOT FOUND)"
+[ -n "$LK_CUSTOM_WEBRTC" ] && echo "[env-rv1126b] LK_CUSTOM_WEBRTC=$LK_CUSTOM_WEBRTC"

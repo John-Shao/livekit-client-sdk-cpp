@@ -120,37 +120,64 @@ device/rockchip/rv1126b/04_atk_dlrv1126b_mipi720x1280_defconfig
 
 `alientek_rv1126b_defconfig` 通过片段 include 配齐：aarch64 / MPP / Weston / Mesa3D / Qt5 / LVGL / GStreamer-RTSP / FFmpeg(GPL+NONFREE) / connman / OpenSSH / 中文字体 / 亚洲/上海时区。
 
-### [待办] 并行推进两条线
-
-**线 A**：触发首次完整构建（取得 Buildroot host toolchain + target rootfs）—— **耗时数小时**，建议 `tmux` + 后台跑。
+### [9] Host 依赖预装 + Buildroot Lunch
 
 ```bash
+sudo apt update
+sudo apt install -y \
+  build-essential git ssh make gcc g++ libssl-dev liblz4-tool \
+  expect patchelf chrpath gawk texinfo diffstat binfmt-support \
+  qemu-user-static live-build bison flex fakeroot cmake \
+  gcc-multilib g++-multilib unzip device-tree-compiler \
+  ncurses-dev libncurses5-dev bzip2 expat bc python3-pip \
+  python3-pyelftools u-boot-tools rsync cpio file \
+  libgmp-dev libmpc-dev tmux
+```
+
+新装：`expat libncurses5-dev libubootenv-tool u-boot-tools tmux`；升级若干。其余已存在。
+
+```bash
+./build.sh lunch
+# 菜单：Pick a defconfig → 输入 4
+# 选中: 04_atk_dlrv1126b_mipi720x1280_defconfig
+# 配置写入: output/.config
+# Log saved at output/sessions/2026-04-24_16-30-00
+```
+
+Lunch 菜单暴露的 6 档含义已确认：
+
+| 序号 | defconfig | 含义 |
+|---|---|---|
+| 1 | 01_atk_dlrv1126b_automipi_defconfig | **出厂固件配置**（编译所有 MIPI 屏 DT，启动时自动识别） |
+| 2 | 02_..._automipi_amp_mcu | 多核异构，MCU 跑 amp.img |
+| 3 | 03_..._automipi_ipc | IPC 应用开发，多媒体走 Rockit（非 GStreamer） |
+| 4 | 04_..._mipi720x1280 | **选中** — 720×1280 MIPI 屏，多媒体走 GStreamer |
+| 5 | 05_..._mipi800x1280 | 800×1280 |
+| 6 | 06_..._mipi1080x1920 | 1080×1920 |
+
+补充观察：**除 ipc 档外，其他配置多媒体默认 GStreamer 框架**（livekit 友好）。ipc 档走 Rockit（Rockchip 自家媒体栈），想对齐 Rockchip IPC 生态时再切。
+
+### [10] 启动 Buildroot 全量构建
+
+```bash
+tmux new -s rkbuild
 cd ~/atk-dlrv1126b-sdk
-./build.sh lunch                            # 选 rv1126b → 04_atk_dlrv1126b_mipi720x1280
-# 或直接指定（如果脚本支持）
-./build.sh 04_atk_dlrv1126b_mipi720x1280    # 走 build.sh → mk-all.sh
-# 首次 build 命令（等 lunch 完了再跑）
-nohup ./build.sh 2>&1 > build-$(date +%Y%m%d).log &
-tail -f build-*.log
+./build.sh 2>&1 | tee build-$(date +%Y%m%d-%H%M).log
+# Ctrl-B D 脱离；tmux attach -t rkbuild 重连；tail -f build-*.log 外部看
 ```
 
-构建产物关键路径（构建后 facts.md §1.1 可填）：
-- Buildroot host 工具链：`buildroot/output/rockchip_rv1126b/host/usr/bin/aarch64-buildroot-linux-gnu-*`
-- Target sysroot：`buildroot/output/rockchip_rv1126b/host/aarch64-buildroot-linux-gnu/sysroot/`
-- 镜像：`output/firmware/` 或 `rockdev/`
+运行时资源基线：418G 可用磁盘 / 8 核 / 7.7G RAM + 8G swap。
 
-**线 B**：板端 Phase 0 采集（先烧一版出厂固件到板子，再跑 `phase0-collect-board.sh`）。如果板子已有可用系统，直接进线 B 不等线 A。
+预期耗时分段（首次）：U-Boot 10-20min → Kernel 20-40min → Recovery 5-10min → **Buildroot 1.5-4h（含 dl/ 下载 3-5GB）** → Firmware 打包 5-10min。总 2-6h。
 
-```bash
-# 把脚本推到板子（示例，用 adb 或 scp）
-adb push scripts/phase0-collect-board.sh /tmp/  # 或 scp root@<board-ip>:/tmp/
-# 板端执行
-ssh root@<board-ip> 'bash /tmp/phase0-collect-board.sh' | tee phase0-board.log
-```
+产出（构建完成后 facts.md §1.1 / §4 可全填）：
+- `buildroot/output/rockchip_rv1126b/host/usr/bin/aarch64-buildroot-linux-gnu-*`（livekit 真正要用的 toolchain）
+- `buildroot/output/rockchip_rv1126b/host/aarch64-buildroot-linux-gnu/sysroot/`（带 OpenSSL/ALSA/MPP/RGA 的完整 sysroot）
+- `rockdev/` 或 `output/firmware/`（boot.img / rootfs.img / uboot.img / parameter.txt，板子到手后烧录用）
 
----
+### [待办] Build 完成后回收
 
-**下一步决策点**（跑之前告诉我）：
-
-1. 线 A 的完整 `./build.sh` 首次构建要占 50–80GB 磁盘、2–6h 墙钟时间；如果只想拿 toolchain/sysroot 不出整镜像，可以仅 `./build.sh buildroot` 起一轮 buildroot target build（仍要 1h+）
-2. 线 B 前提是板子能跑一个系统（出厂 + 串口或网口能连）——你现在板子是**空**的还是有 ATK 出厂固件？
+1. `tail -100 build-*.log` 贴回确认成功或截取最后错误
+2. `ls buildroot/output/rockchip_rv1126b/host/usr/bin/aarch64-buildroot-linux-gnu-*` 确认 toolchain 生成
+3. 用新 toolchain 重跑 `./scripts/phase0-collect-host.sh`，填 facts.md §1.1/§1.2/§4 最终值
+4. 板子到位后进线 B（Phase 0 板端采集）

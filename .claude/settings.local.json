@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git rm *)",
+      "Bash(git commit *)",
+      "Bash(cmake --version)",
+      "Read(//d/08-嵌入式开发/ZhengdianYuanzi/RockChipData/【正点原子】ATK-DLRV1126B开发板（A盘资料-基础资料）/07、RK官方文档/docs//**)",
+      "Bash(pdftotext -layout \"/d/08-嵌入式开发/ZhengdianYuanzi/RockChipData/【正点原子】ATK-DLRV1126B开发板（A盘资料-基础资料）/07、RK官方文档/docs/en/Common/MPP/Rockchip_Developer_Guide_MPP_EN.pdf\" /tmp/mpp_guide.txt)",
+      "Read(//tmp/**)",
+      "Bash(awk '/3\\\\.4 Encoder data flow interface/,/5\\\\. MPP library/' /tmp/mpp_guide.txt)",
+      "Bash(awk '/^4\\\\. MPP demo description/,/^6\\\\. Frequently/' /tmp/mpp_guide.txt)",
+      "Bash(awk '/^5\\\\. MPP library compiling/,/^6\\\\. Frequently/' /tmp/mpp_guide.txt)",
+      "Read(//d/08-嵌入式开发/ZhengdianYuanzi//**)",
+      "Bash(pdftotext -layout \"/d/08-嵌入式开发/ZhengdianYuanzi/RockChipData/【正点原子】ATK-DLRV1126B开发板（A盘资料-基础资料）/07、RK官方文档/docs/en/Linux/Multimedia/Rockchip_User_Guide_Linux_Rockit_EN.pdf\" /tmp/rockit.txt)",
+      "Bash(pdftotext -layout \"/d/08-嵌入式开发/ZhengdianYuanzi/RockChipData/【正点原子】ATK-DLRV1126B开发板（A盘资料-基础资料）/07、RK官方文档/docs/en/Linux/System/Rockchip_Developer_Guide_Debian_EN.pdf\" /tmp/debian.txt)",
+      "Bash(pdftotext -layout \"/d/08-嵌入式开发/ZhengdianYuanzi/RockChipData/【正点原子】ATK-DLRV1126B开发板（A盘资料-基础资料）/07、RK官方文档/docs/en/Linux/System/Rockchip_Developer_Guide_Buildroot_EN.pdf\" /tmp/buildroot.txt)",
+      "Bash(pdftotext -layout \"/d/08-嵌入式开发/ZhengdianYuanzi/RockChipData/【正点原子】ATK-DLRV1126B开发板（A盘资料-基础资料）/07、RK官方文档/docs/en/RV1126B/Quick-start/Rockchip_RV1126B_Quick_Start_Linux_EN.pdf\" /tmp/rv1126b_qs.txt)",
+      "Bash(pdftotext -layout \"/d/08-嵌入式开发/ZhengdianYuanzi/RockChipData/【正点原子】ATK-DLRV1126B开发板（A盘资料-基础资料）/07、RK官方文档/docs/en/RV1126B/Rockchip_Developer_Guide_Linux_Software_EN.pdf\" /tmp/soft.txt)"
+    ]
+  }
+}

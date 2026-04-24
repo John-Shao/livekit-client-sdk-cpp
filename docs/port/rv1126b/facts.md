@@ -11,7 +11,9 @@
 - ATK 覆写 tag：`atk-dlrv1126b-release-v1.0` / `v1.1`（覆写 buildroot、device/rockchip、u-boot、rkbin、kernel-6.1、camera_engine_rkaiq、ipc_drv_ko）
 - SDK 根路径（VM）：`/home/alientek/atk-dlrv1126b-sdk/`
 - 同步方式：`.repo/project-objects/` 本地自带（5.1GB），`./repo.sh` 仅做本地 checkout（`repo sync -l`，无需联网）
-- 主机 OS / GCC 版本：<!-- TODO 从 phase0-host.log 填 -->
+- Sync 后工作树大小：21 GB（含所有 external/*、yocto/、rtos/、hal/）
+- Sync 后顶层：`app/ buildroot/ device/ docs/ external/ hal/ kernel/ kernel-6.1/ prebuilts/ rkbin/ rtos/ tools/ u-boot/ yocto/` + linkfile `build.sh` `Makefile` `rkflash.sh`
+- 主机 OS / GCC 版本：<!-- TODO 需要 `lsb_release -a && gcc --version` -->
 
 ### 1.1 交叉编译工具链
 
@@ -20,8 +22,11 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 **(a) Prebuilt ARM toolchain**（仅用于 kernel / u-boot / rkbin 构建）
 - 路径：`$SDK_ROOT/prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/`
 - 前缀：`aarch64-none-linux-gnu-`（bare-metal 三元组，无 sysroot 绑定）
-- GCC 版本：10.3.1（ARM 发布）
-- **不用于** 编译 livekit 用户态代码（glibc 版本可能与 rootfs 不匹配）
+- 别名：`aarch64-rockchip1031-linux-gnu-gcc -> aarch64-none-linux-gnu-gcc`（Rockchip 贴牌符号链接，避免 Rockchip 构建脚本到处改三元组）
+- GCC 版本：`10.3.1 20210621`（ARM Toolchain A-profile 10.3-2021.07）
+- `-dumpmachine`：`aarch64-none-linux-gnu`
+- `-print-sysroot`：`.../aarch64-none-linux-gnu/libc/`（内含 `usr/lib64/libstdc++.so.6`，**其他库全缺**）
+- **不用于** 编译 livekit 用户态代码（该 sysroot 只够 kernel/u-boot 自举，不含 OpenSSL/ALSA/libudev/MPP/RGA）
 
 **(b) Buildroot host toolchain**（livekit 交叉编译用此套）
 - 路径：`$SDK_ROOT/buildroot/output/rockchip_rv1126b/host/usr/bin/`（<!-- TODO 确认 defconfig 名 -->）
@@ -45,7 +50,7 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 | librga | <!-- TODO --> |  |  |
 | libstdc++ | <!-- TODO --> |  |  |
 
-### 1.3 SDK 源码位置（manifest 声明路径，sync 后出现）
+### 1.3 SDK 源码位置（sync 后已确认存在 ✓）
 
 | 路径 | tag | 用途（livekit 视角） |
 |---|---|---|
@@ -62,8 +67,9 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 
 ### 1.4 Rust 环境
 
-- `rustc` 版本：<!-- TODO -->
-- `aarch64-unknown-linux-gnu` 已安装：<!-- TODO y/n -->
+- `rustc` 版本：未安装（脚本输出 "rustup 未安装 — 先 curl https://sh.rustup.rs | sh"）
+- `aarch64-unknown-linux-gnu` 已安装：n
+- 后续：Phase 1 webrtc-sys 版本锁定后再决定安装 rustup 还是 distro rustc
 
 ## 2. 板端（ATK-DLRV1126B）
 
@@ -124,9 +130,13 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 - **选定**：Buildroot（tentative，待板端实测确认）
 - **理由**：
   - ATK 发布包默认预置 `buildroot/` 目录（`使用说明.md` 明确指示用户走 Buildroot 流程）
-  - 基础 manifest 只实际启用了 `linux6.1-rkr2`（含 `linux/buildroot`），`debian12-rkr2` 被注释掉
-  - Rockchip 同时提供 `yocto-scarthgap-release-r2`，若后续空间/依赖受限再考虑切 Yocto
+  - 顶层 manifest `rv1126b_linux6.1_release.xml` 未启用 debian（`<include debian12-rkr2/>` 注释掉）
+  - 但 sync 后 `yocto/` 顶层目录存在（基础 manifest 启用了 `yocto-scarthgap-release-r2`），Yocto 保留为备选
   - Debian 12 需要 ~500MB+ rootfs，对 NAND/eMMC 空间敏感的 IPC 类场景不首选
+- 待补事实：
+  - Buildroot 针对 RV1126B 的 defconfig 文件名 <!-- TODO 例 `rockchip_rv1126b_defconfig` -->
+  - `device/rockchip/` 下对应的 BoardConfig <!-- TODO 例 `.BoardConfig-*.mk` -->
+  - Buildroot 默认 libc 是 glibc 还是 musl <!-- TODO 看 defconfig 里 BR2_TOOLCHAIN_BUILDROOT_LIBC= -->
 
 ## 5. 原始收集输出（附）
 

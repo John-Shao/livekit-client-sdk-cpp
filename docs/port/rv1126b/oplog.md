@@ -64,27 +64,55 @@ Manifest 推断的事实已写入 [facts.md](facts.md) §1、§1.1、§1.3、§4
 - `external/mpp` tag 是 `linux-6.1-stan-rkr7.1`（比其他工程高半级）
 - Rootfs 暂定 Buildroot
 
-### [待办] 运行 `repo sync -l` 并触发 Phase 0 收集
+### [6] 运行 `./repo.sh` 本地 checkout
 
 ```bash
 cd ~/atk-dlrv1126b-sdk
-.repo/repo/repo sync -l -j$(nproc)       # 替代 ./repo.sh 的 -j2
-ls                                       # 期望: app/ device/ external/ kernel-6.1/ u-boot/ buildroot/ prebuilts/ tools/ rkbin/ docs/
-du -sh .
+./repo.sh
+```
 
+- 52 个 project 在 28.8s 内完成（`-j2` 也够用，纯本地 IO）
+- sync 后工作树 21GB
+- 顶层新增目录：`app/ build.sh Copyright_Statement.md device/ docs/ external/ hal/ kernel/ kernel-6.1/ Makefile prebuilts/ rkbin/ rkflash.sh rtos/ tools/ u-boot/ yocto/`
+- **修正**：`yocto/` 也被同步（此前误以为基础 manifest 未启用）
+
+### [7] Phase 0 主机侧收集脚本首次成功运行
+
+```bash
 cd ~/livekit/livekit-sdk-cpp-0.3.3
 export SDK_ROOT=~/atk-dlrv1126b-sdk
 ./scripts/phase0-collect-host.sh 2>&1 | tee phase0-host.log
 ```
 
-预期结果与 fallback 说明：
+实际结果（详见 [facts.md](facts.md) §1）：
 
-| 脚本段 | 预期 |
+| 段 | 实测 |
 |---|---|
-| `[1] SDK 版本` | 命中 `.repo/manifests/RV1126B_Linux6.1_SDK_Note.md` |
-| `[2] 工具链` | WARNING: Buildroot 工具链未构建 → fallback 到 prebuilt 打印版本，这是正常的 |
-| `[3] Sysroot` | 跳过（需先跑 buildroot） |
-| `[5] MPP/Rockit/RGA` | sync 完应全部命中 |
-| `[6] Rust` | 未装 → "rustup 未安装"，现在不急 |
+| `[1]` | ✓ 命中 `.repo/manifests/RV1126B_Linux6.1_SDK_Note.md` |
+| `[2]` | Buildroot 未构建，fallback 到 prebuilt：`aarch64-none-linux-gnu-gcc 10.3.1 20210621`；发现额外别名 `aarch64-rockchip1031-linux-gnu-gcc` |
+| `[3]` | Prebuilt sysroot 仅含 `libstdc++.so.6`，其他全部 `(missing)` —— 符合预期 |
+| `[4]` | Prebuilt 无 pkg-config 目录 —— 符合预期 |
+| `[5]` | ✓ `external/mpp` / `external/rockit` / `external/linux-rga` 全部命中 |
+| `[6]` | `rustup` 未装 |
 
-收完日志贴回对话，继续 Phase 0 的板端部分与 rootfs/toolchain 决策。
+### [待办] 补齐 Buildroot defconfig + 板端采集
+
+剩余 facts.md TODO 需在 VM 上一次性解决：
+
+```bash
+cd ~/atk-dlrv1126b-sdk
+
+# 1) Buildroot defconfig 候选（RV1126B 专用）
+ls buildroot/configs/ | grep -iE 'rv1126b|rockchip' | head
+
+# 2) device/rockchip BoardConfig
+ls device/rockchip/rv1126b_rk*/ 2>/dev/null || ls device/rockchip/ | head -20
+find device/rockchip -maxdepth 3 -name 'BoardConfig*.mk' | head
+
+# 3) 主机 OS / GCC
+lsb_release -a && gcc --version | head -1
+
+# 4) 板端脚本（先把 scripts/phase0-collect-board.sh scp 到板子再跑）
+```
+
+跑完贴回，我把 §1.1 (buildroot GCC)、§4 (defconfig/libc)、§3（webrtc-sys pinned 版本）这三块 TODO 补上，然后板端脚本启动 §2 的数据采集。

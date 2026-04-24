@@ -95,24 +95,62 @@ export SDK_ROOT=~/atk-dlrv1126b-sdk
 | `[5]` | ✓ `external/mpp` / `external/rockit` / `external/linux-rga` 全部命中 |
 | `[6]` | `rustup` 未装 |
 
-### [待办] 补齐 Buildroot defconfig + 板端采集
+### [8] 定位 Buildroot / Kernel / U-Boot defconfig 映射
 
-剩余 facts.md TODO 需在 VM 上一次性解决：
+```bash
+ls buildroot/configs/ | grep -iE 'rv1126b|rockchip'     # 16 个 RV1126B 专用
+ls device/rockchip/rv1126b/                              # 6 个 ATK 板级 defconfig
+cat buildroot/configs/alientek_rv1126b_defconfig         # 135 行，片段式 include
+cat device/rockchip/rv1126b/04_atk_dlrv1126b_mipi720x1280_defconfig
+lsb_release -a && gcc --version | head -1                # Ubuntu 20.04.2 + gcc 9.4.0
+```
+
+**硬件确认**：ATK-DLRV1126B + 竖向长条屏 720×1280 → **板级 defconfig 选 `04_atk_dlrv1126b_mipi720x1280_defconfig`**。
+
+映射链（详见 [facts.md](facts.md) §4）：
+
+```
+device/rockchip/rv1126b/04_atk_dlrv1126b_mipi720x1280_defconfig
+  → RK_BUILDROOT_CFG  "alientek_rv1126b"
+  → RK_KERNEL_CFG     "alientek_rv1126b_defconfig"
+  → RK_KERNEL_DTS     "rv1126b-alientek-mipi720x1280"
+  → RK_UBOOT_CFG      "alientek_rv1126b" (+ SPL + FIT)
+  → RK_WIFIBT=n
+```
+
+`alientek_rv1126b_defconfig` 通过片段 include 配齐：aarch64 / MPP / Weston / Mesa3D / Qt5 / LVGL / GStreamer-RTSP / FFmpeg(GPL+NONFREE) / connman / OpenSSH / 中文字体 / 亚洲/上海时区。
+
+### [待办] 并行推进两条线
+
+**线 A**：触发首次完整构建（取得 Buildroot host toolchain + target rootfs）—— **耗时数小时**，建议 `tmux` + 后台跑。
 
 ```bash
 cd ~/atk-dlrv1126b-sdk
-
-# 1) Buildroot defconfig 候选（RV1126B 专用）
-ls buildroot/configs/ | grep -iE 'rv1126b|rockchip' | head
-
-# 2) device/rockchip BoardConfig
-ls device/rockchip/rv1126b_rk*/ 2>/dev/null || ls device/rockchip/ | head -20
-find device/rockchip -maxdepth 3 -name 'BoardConfig*.mk' | head
-
-# 3) 主机 OS / GCC
-lsb_release -a && gcc --version | head -1
-
-# 4) 板端脚本（先把 scripts/phase0-collect-board.sh scp 到板子再跑）
+./build.sh lunch                            # 选 rv1126b → 04_atk_dlrv1126b_mipi720x1280
+# 或直接指定（如果脚本支持）
+./build.sh 04_atk_dlrv1126b_mipi720x1280    # 走 build.sh → mk-all.sh
+# 首次 build 命令（等 lunch 完了再跑）
+nohup ./build.sh 2>&1 > build-$(date +%Y%m%d).log &
+tail -f build-*.log
 ```
 
-跑完贴回，我把 §1.1 (buildroot GCC)、§4 (defconfig/libc)、§3（webrtc-sys pinned 版本）这三块 TODO 补上，然后板端脚本启动 §2 的数据采集。
+构建产物关键路径（构建后 facts.md §1.1 可填）：
+- Buildroot host 工具链：`buildroot/output/rockchip_rv1126b/host/usr/bin/aarch64-buildroot-linux-gnu-*`
+- Target sysroot：`buildroot/output/rockchip_rv1126b/host/aarch64-buildroot-linux-gnu/sysroot/`
+- 镜像：`output/firmware/` 或 `rockdev/`
+
+**线 B**：板端 Phase 0 采集（先烧一版出厂固件到板子，再跑 `phase0-collect-board.sh`）。如果板子已有可用系统，直接进线 B 不等线 A。
+
+```bash
+# 把脚本推到板子（示例，用 adb 或 scp）
+adb push scripts/phase0-collect-board.sh /tmp/  # 或 scp root@<board-ip>:/tmp/
+# 板端执行
+ssh root@<board-ip> 'bash /tmp/phase0-collect-board.sh' | tee phase0-board.log
+```
+
+---
+
+**下一步决策点**（跑之前告诉我）：
+
+1. 线 A 的完整 `./build.sh` 首次构建要占 50–80GB 磁盘、2–6h 墙钟时间；如果只想拿 toolchain/sysroot 不出整镜像，可以仅 `./build.sh buildroot` 起一轮 buildroot target build（仍要 1h+）
+2. 线 B 前提是板子能跑一个系统（出厂 + 串口或网口能连）——你现在板子是**空**的还是有 ATK 出厂固件？

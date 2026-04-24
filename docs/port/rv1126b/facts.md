@@ -13,7 +13,8 @@
 - 同步方式：`.repo/project-objects/` 本地自带（5.1GB），`./repo.sh` 仅做本地 checkout（`repo sync -l`，无需联网）
 - Sync 后工作树大小：21 GB（含所有 external/*、yocto/、rtos/、hal/）
 - Sync 后顶层：`app/ buildroot/ device/ docs/ external/ hal/ kernel/ kernel-6.1/ prebuilts/ rkbin/ rtos/ tools/ u-boot/ yocto/` + linkfile `build.sh` `Makefile` `rkflash.sh`
-- 主机 OS / GCC 版本：<!-- TODO 需要 `lsb_release -a && gcc --version` -->
+- 主机 OS：Ubuntu 20.04.2 LTS (focal) / gcc 9.4.0-1ubuntu1~20.04.1 / 9.4.0
+  - 注意：Buildroot 某些较新包需要 Python 3.9+ 或 make 4.3+；focal 自带 Python 3.8 / make 4.2.1，遇到相关报错再装 backports
 
 ### 1.1 交叉编译工具链
 
@@ -127,16 +128,31 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 
 ## 4. Rootfs 决策
 
-- **选定**：Buildroot（tentative，待板端实测确认）
-- **理由**：
-  - ATK 发布包默认预置 `buildroot/` 目录（`使用说明.md` 明确指示用户走 Buildroot 流程）
-  - 顶层 manifest `rv1126b_linux6.1_release.xml` 未启用 debian（`<include debian12-rkr2/>` 注释掉）
-  - 但 sync 后 `yocto/` 顶层目录存在（基础 manifest 启用了 `yocto-scarthgap-release-r2`），Yocto 保留为备选
-  - Debian 12 需要 ~500MB+ rootfs，对 NAND/eMMC 空间敏感的 IPC 类场景不首选
-- 待补事实：
-  - Buildroot 针对 RV1126B 的 defconfig 文件名 <!-- TODO 例 `rockchip_rv1126b_defconfig` -->
-  - `device/rockchip/` 下对应的 BoardConfig <!-- TODO 例 `.BoardConfig-*.mk` -->
-  - Buildroot 默认 libc 是 glibc 还是 musl <!-- TODO 看 defconfig 里 BR2_TOOLCHAIN_BUILDROOT_LIBC= -->
+- **选定**：Buildroot
+- **板级 defconfig**（`build.sh lunch` 选这个）：
+  `device/rockchip/rv1126b/04_atk_dlrv1126b_mipi720x1280_defconfig`
+  - 匹配硬件：ATK-DLRV1126B + 竖向长条屏 (MIPI 720×1280)
+  - `RK_BUILDROOT_CFG="alientek_rv1126b"` → 映射到 `buildroot/configs/alientek_rv1126b_defconfig`
+  - `RK_KERNEL_CFG="alientek_rv1126b_defconfig"`
+  - `RK_KERNEL_DTS_NAME="rv1126b-alientek-mipi720x1280"`
+  - `RK_UBOOT_CFG="alientek_rv1126b"` + `RK_UBOOT_SPL=y` + `RK_USE_FIT_IMG=y`
+  - `RK_WIFIBT=n`（该板型无 WiFi/BT；livekit 走有线）
+  - `RK_ROOTFS_PREBUILT_TOOLS=y` + `RK_ROOTFS_INSTALL_MODULES=y`
+- **Buildroot defconfig 组成**（`alientek_rv1126b_defconfig`，135 行，片段式 include）：
+  - 架构：`chips/rv1126b_aarch64.config` → **aarch64**，glibc（由 base/base.config 默认）
+  - 媒体：`multimedia/mpp.config` + `multimedia/audio.config` + `multimedia/camera.config` + `multimedia/gst/*` (rtsp/video/audio/camera)
+  - GUI 栈：`gui/weston.config`（**Wayland** 合成器）+ `gui/qt5.config` + `gui/lvgl.config` + `gpu/mesa3d.config`
+  - 字体/语言：`font/chinese.config`、`BR2_PACKAGE_NOTO_SANS_SC=y`、`BR2_TARGET_LOCALTIME="Asia/Shanghai"`
+  - 网络：`connman` + `dnsmasq` + `ntp` + `openssh`
+  - TLS：`GNUTLS_OPENSSL=y`，OpenSSL 被 nginx/openssh 传递拉入（不需要额外声明）
+  - FFmpeg：`GPL=y NONFREE=y`，启用 x264/x265 —— **商用镜像需注意 license**
+  - Rockchip 偏好：`BR2_PREFER_ROCKCHIP_RGA=y`
+  - Rootfs overlay：`board/alientek/atk-dlrv1126b/fs-overlay/`
+  - 体积警告：包含 OpenCV4、Qt5、Samba、LIVE555、MediaMTX、nginx-rtmp、完整 Python3 —— 首次 build 估计镜像 >300MB，后续若空间紧可按需裁
+- **Kernel defconfig**：`alientek_rv1126b_defconfig`（在 `kernel-6.1/arch/arm64/configs/` 下）
+- **备选 rootfs**：
+  - `yocto/`（manifest 已 sync，未启用）——若 Buildroot 太大或包管理不够灵活再切
+  - Debian 12（manifest 中注释掉，需手工启用）——IPC 场景空间敏感不首选
 
 ## 5. 原始收集输出（附）
 

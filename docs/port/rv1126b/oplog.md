@@ -269,9 +269,52 @@ ssh rv1126b-board 'bash -s' < <scan-script> > phase0-board-extended.log
 
 所有 §1 主机侧、§2 板端、§4 rootfs 决策事实已固化。剩余 §3 webrtc-sys pinned 版本留给 Phase 1 决策时查代码时填（需读 `client-sdk-rust/webrtc-sys/libwebrtc/build.rs`）。
 
-### [Phase 1 切入建议]
+### [15] Phase 1 — libWebRTC 来源决策
 
-1. 硬件 smoke：VM 推板端用 `mpi_enc_test` + 摄像头采帧 → 验证 H.264 硬编能 work
-2. 测 DRM/KMS plane overlay（无 Mali 无 EGL 路径），用板上现成 libdrm 写最小渲染 demo
-3. 读 `client-sdk-rust/webrtc-sys/libwebrtc/build.rs` 查 pinned libWebRTC commit，确认 aarch64 prebuilt URL 是否存在
-4. 若无 prebuilt：自建 libWebRTC aarch64 分支，用 §1.1 toolchain 编
+`client-sdk-rust/` submodule 在 `.gitmodules` 已声明但从未作为 gitlink commit，目录为空。手动 clone：
+
+```bash
+rmdir client-sdk-rust  # 空占位
+git clone --depth 20 https://github.com/livekit/client-sdk-rust client-sdk-rust
+# 注：clone 过程遇到 "initial ref transaction called with existing refs" BUG，
+# objects 下完但 refs 没更新。绕法：
+cd client-sdk-rust && git fetch --depth 1 origin main && git checkout -f FETCH_HEAD
+```
+
+HEAD 落在 upstream `main` 的 `fd3df87`（2026-04-24 最新）。
+
+读 `client-sdk-rust/webrtc-sys/build/src/lib.rs` 取关键常量：
+
+- `WEBRTC_TAG = "webrtc-7af9351"`
+- `target_arch`: `aarch64 → arm64`
+- `download_url`: `https://github.com/livekit/rust-sdks/releases/download/{TAG}/webrtc-{os}-{arch}-{profile}.zip`
+
+组合出 prebuilt URL 并验证：
+
+```bash
+curl -s https://api.github.com/repos/livekit/rust-sdks/releases/tags/webrtc-7af9351 \
+  | jq -r '.assets[] | select(.name=="webrtc-linux-arm64-release.zip") | "\(.name) \(.size)"'
+# → webrtc-linux-arm64-release.zip 165522664   （158 MB）
+```
+
+**存在 ✓。Phase 1 结论锁定走路径 ①**（prebuilt 直接下）。详见 [decision-webrtc.md](decision-webrtc.md)。
+
+再验证 Buildroot sysroot 的 pkg-config 硬依赖（webrtc-sys/build.rs Linux 分支 `unwrap()` 了 glib-2.0/gobject-2.0/gio-2.0 的 pkg-config probe）：
+
+```bash
+ssh rv1126b-vm 'SYSROOT=~/atk-dlrv1126b-sdk/buildroot/output/alientek_rv1126b/host/aarch64-buildroot-linux-gnu/sysroot; \
+  find $SYSROOT/usr/lib/pkgconfig -name "g{lib,object,io}-2.0.pc"'
+```
+
+glib / gobject / gio 2.76.1 三兄弟 .pc + .so 全在 ✓。
+
+**未提交 submodule gitlink**，等 Phase 3 CMake 实际编译通过后再 pin 到验证过的 commit。
+
+### [Phase 2 切入建议]
+
+1. VM 上装 `rustup` + `aarch64-unknown-linux-gnu` target：`curl https://sh.rustup.rs | sh && rustup target add aarch64-unknown-linux-gnu`
+2. 创建 `client-sdk-rust/.cargo/config.toml` + `scripts/env-rv1126b.sh`（参见 [plan.md §Phase 2](plan.md#phase-2--rust-交叉编译工具链05-1-天)）
+3. 把 Buildroot toolchain 从 VM 导出为可移动 tarball（或者直接用 VM 上原地 sysroot）
+4. 先 `cargo build -p webrtc-sys --target aarch64-unknown-linux-gnu` 验证 prebuilt 下载 + 头依赖解析走通，再编整个 livekit-ffi
+
+推进时间预估：Rust toolchain + 首次 webrtc-sys 编译 = 0.5-1 天（plan.md 原估）

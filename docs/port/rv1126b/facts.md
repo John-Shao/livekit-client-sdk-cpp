@@ -214,11 +214,16 @@ SDK 内共有 **两套** aarch64 工具链，用途不同：
 | 零拷贝 | 无 `/dev/dma_heaps/`，有 `/dev/rga` + MPP + V4L2-M2M | Rockchip CMA 或 V4L2 DMABUF export，不用 dmabuf heaps |
 | 相机 | rkisp_v11 + rkaiq_3A_server running | 走标准 V4L2 capture，不需额外 ISP 初始化 |
 
-## 3. webrtc-sys pinned 版本（Phase 1 决策直接输入）
+## 3. webrtc-sys pinned 版本（Phase 1 决策输入）✓
 
-- libWebRTC 版本 / commit：<!-- TODO 从 client-sdk-rust/webrtc-sys/libwebrtc/build.rs 查 -->
-- aarch64-linux prebuilt URL 是否存在：<!-- TODO y/n -->
-- prebuilt URL（若存在）：<!-- TODO -->
+详见 [decision-webrtc.md](decision-webrtc.md)。摘要：
+
+- **锚点常量**：`WEBRTC_TAG = "webrtc-7af9351"`（在 `client-sdk-rust/webrtc-sys/build/src/lib.rs:31`）
+- **aarch64-linux prebuilt 存在**：✓ 158 MB
+- **prebuilt URL**：<https://github.com/livekit/rust-sdks/releases/download/webrtc-7af9351/webrtc-linux-arm64-release.zip>
+- **Phase 1 结论**：走路径 ① —— 直接下载官方 prebuilt，`webrtc-sys/build.rs` 在 `target = aarch64-unknown-linux-gnu` 时自动处理
+- **sysroot 硬依赖**：glib-2.0 / gobject-2.0 / gio-2.0 (all 2.76.1) —— Buildroot sysroot 全有 ✓
+- **待验证（非阻塞）**：prebuilt 内嵌 debian_bullseye_arm64-sysroot 的 glib 头 vs. Buildroot sysroot 的 glib 2.76.1 ABI 是否兼容
 
 ## 4. Rootfs 决策
 

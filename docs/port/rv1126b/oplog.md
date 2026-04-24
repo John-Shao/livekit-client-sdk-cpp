@@ -175,6 +175,30 @@ cd ~/atk-dlrv1126b-sdk
 - `buildroot/output/rockchip_rv1126b/host/aarch64-buildroot-linux-gnu/sysroot/`（带 OpenSSL/ALSA/MPP/RGA 的完整 sysroot）
 - `rockdev/` 或 `output/firmware/`（boot.img / rootfs.img / uboot.img / parameter.txt，板子到手后烧录用）
 
+### [11] Build 失败补修：缺 `gettext`
+
+首次 build 在 Buildroot 阶段失败。U-Boot + Kernel 均通过（FIT image + `output/firmware/boot.img` 已产出），错误信息：
+
+```
+Start building buildroot(2024.02)
+==========================================
+
+Your msgmerge is missing
+Please install it:
+sudo apt-get install gettext
+
+ERROR: Running .../mk-rootfs.sh - build_buildroot failed!
+```
+
+**修法**（不需要从头 rebuild）：
+
+```bash
+sudo apt install -y gettext
+./build.sh rootfs 2>&1 | tee -a build-<原日期>.log   # 续跑 rootfs 阶段
+```
+
+**教训**：之前 [9] 的 apt 清单漏了 `gettext`，Buildroot 2024.02 的 host dep 检查会专门校验 `msgmerge`。后续若仍有缺包按错误提示逐个补即可。
+
 ### [待办] Build 完成后回收
 
 1. `tail -100 build-*.log` 贴回确认成功或截取最后错误

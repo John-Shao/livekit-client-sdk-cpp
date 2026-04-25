@@ -788,6 +788,73 @@ mpp_mem_pool: mpp_mem_pool_put invalid mem pool ptr ... check (nil)
 
 **注**：libwebrtc 本身的 `RTC_LOG(LS_INFO) << "[mpp] InitEncode ..."` 没出现在 stderr，因为这个 build 没把 RTC_LOG 路由到 stdout（默认走 syslog 或丢弃）。MPP 自己的 `mpp[3908]: ...` 日志倒是直出 stderr，已经够诊断。
 
+### [34] Phase 6.2：MPP H.264 解码器
+
+`port/rv1126b-mpp` `ff94ac9` —— 跟 6.1.4 编码器对称，4 个新文件 + 改 build.rs + 改 video_decoder_factory.cpp：
+
+```
+webrtc-sys/src/rockchip_mpp/
+├── rockchip_mpp_decoder.h            — RockchipMppH264DecoderImpl : webrtc::VideoDecoder 声明
+├── rockchip_mpp_decoder.cpp          — Configure / Decode / drainOneFrame 实现
+├── rockchip_mpp_decoder_factory.h    — RockchipMppVideoDecoderFactory : webrtc::VideoDecoderFactory 声明
+└── rockchip_mpp_decoder_factory.cpp  — 同 encoder 的 IsSupported() 双闸（共用一个 env flag）
+webrtc-sys/build.rs                   — arm/Linux 块加 decoder.cpp / decoder_factory.cpp 编译条目
+webrtc-sys/src/video_decoder_factory.cpp — InternalFactory ctor 加 #if USE_ROCKCHIP_MPP_VIDEO_CODEC 注册块
+```
+
+#### [34.1] 解码序列（套 mpi_dec_test.c 范式）
+
+```
+Configure:
+  mpp_create(&ctx, &mpi)
+  mpi->control(ctx, MPP_DEC_SET_PARSER_SPLIT_MODE, &split=1)   ← Annex-B 多 NAL 一包
+  mpi->control(ctx, MPP_SET_INPUT_TIMEOUT,  MPP_POLL_BLOCK)    ← put_packet 一定吃完才返
+  mpi->control(ctx, MPP_SET_OUTPUT_TIMEOUT, 100ms)             ← get_frame 不卡死线程
+  mpp_init(ctx, MPP_CTX_DEC, MPP_VIDEO_CodingAVC)
+  mpp_packet_init(&packet, NULL, 0)                            ← 长生命周期复用
+Decode(EncodedImage):
+  mpp_packet_set_data/size/pos/length(packet, image.data())
+  retry mpi->decode_put_packet(ctx, packet) up to 50× × 1ms
+  for _ in 0..8:
+    drainOneFrame()
+drainOneFrame:
+  mpi->decode_get_frame(ctx, &frame)
+  if info_change(frame):
+    mpp_buffer_group_get_internal(MPP_BUFFER_TYPE_DRM | CACHABLE)
+    mpp_buffer_group_limit_config(grp, buf_size, 24)
+    MPP_DEC_SET_EXT_BUF_GROUP / MPP_DEC_SET_INFO_CHANGE_READY
+    return true                                                ← 立刻 try 下一帧
+  if err_info or discard: skip
+  NV12 → libyuv NV12ToI420 → VideoFrameBufferPool I420Buffer
+  VideoFrame::Builder → decoded_complete_callback_->Decoded()
+```
+
+#### [34.2] 共用 encoder 的 env 闸
+
+`RockchipMppVideoDecoderFactory::IsSupported()` 用 **完全相同**的 `BOARD_LOOPBACK_USE_MPP=1` + `/dev/mpp_service` 双闸 —— 一个 flag 同时打开编+解。这是有意为之：硬件资源是同一个 VEPU/VDPU 子系统，没有"只硬编不硬解"的合理用例。
+
+#### [34.3] v11 deploy + smoke
+
+build 干净（30s 不到，只重编 6 个新 .o）。`liblivekit_ffi.so` 仍 DT_NEEDED `librockchip_mpp.so.1`，新增 undef 符号 `mpp_packet_init / mpp_buffer_group_limit_config / decode_put_packet / decode_get_frame`，运行时由 ld.so 解析。
+
+35s 板上 smoke：
+- 编码侧仍 906 帧/30s 稳跑
+- 0 leak warning
+- **解码侧 silent** —— `[loopback] track subscribed:` 没出现，房间里只剩板子自己；手机这轮不在线，远端 video track 不存在，libwebrtc 不会实例化解码器，自然没 `mpp_dec:` 日志
+
+待手机或浏览器再次进房：单纯重跑 v11 即可验，预期日志会出现：
+- `[loopback] track subscribed: ... kind=video sid=...`
+- `mpp[NNNN]: mpp_dec: ...`（MPP 自己打的 init 日志）
+- `[mpp-dec] info change WxH stride ...`（我们打的，前提是 RTC_LOG 这次能出 stderr —— 不出也无所谓）
+- `[loopback] remote streams:` 后面应该开始列对端流
+
+#### [34.4] 已知限制（待 6.1.5 / 后续）
+
+- **NV12 → I420 软件转换**：libyuv NV12ToI420 跑在 A53 CPU 上，720p30 大概吃 1 个核 30%。RGA 硬件能干这个活但要 dmabuf 句柄打通。Phase 6.1.5。
+- **DRM 输出还要 I420 → NV12 再转回去**：板子收到我们 decode 出的 I420，BoardLoopback 的 DRM 路径再 I420→NV12 给 plane 用 —— 双向软转，2× CPU 浪费。RGA 零拷贝同时解决这个。
+- **buffer_pool 16 缓冲池**：与 24 个 MPP frame group 容量协同，720p×16 ≈ 6MB CPU 内存，可接受；若用 4K 输入需要调小。
+
+
 
 
 

@@ -540,3 +540,39 @@ ssh rv1126b-vm 'cat ~/livekit/livekit-sdk-cpp-0.3.3/client-sdk-rust/target/aarch
 5. 媒体流（音视频实际数据） → Phase 5/6 边界，可能需要看 [facts.md](facts.md) §2.7 b/h（V4L2 摄像头 / DRM 渲染）的硬件路径整合
 
 预计耗时：1–2 天（plan.md 原估）。如果 control plane 连不上看 STUN/TURN 配置或防火墙；如果协商通了但媒体 stuck 看 ICE candidate 类型 / SDP codec 协商。
+
+### [30] Phase 5a — 板端 smoke 启动（fake URL）
+
+把 dry-run 的 4 个 artifacts 从 `/tmp/livekit-dryrun/` 永久搬到 `/opt/livekit/`（plan.md §Phase 5 规定路径），加 +x。
+
+冒烟启动验证整链路初始化（不走真 server）：
+
+```bash
+ssh rv1126b-board 'cd /opt/livekit && \
+  LD_LIBRARY_PATH=/opt/livekit RUST_LOG=debug SPDLOG_LEVEL=debug \
+  LIVEKIT_URL=wss://invalid-fake-host.local \
+  LIVEKIT_RECEIVER_TOKEN=invalid LIVEKIT_SENDER_IDENTITY=test \
+  timeout 8 ./HelloLivekitReceiver'
+```
+
+8 秒里走完 13 项验证（详见 [phase5-summary.md](phase5-summary.md) §5a 验证清单）：FFI server v0.12.53 / LkRuntime / libwebrtc PeerConnectionFactory / WebRtcVoiceEngine + APM 子模块全初始化、signal_client wss URL 构造、3 次 DNS retry、错误传播 libwebrtc → Rust → C++ → user code、完整析构 cleanup、`exit(0)`。
+
+意外发现：
+
+- 板上无 `lsb_release` → device 上报 `os_version=Unknown`（cosmetic，不阻塞）
+- 板 hostname `ATK-DLRV1126B` 透传到 livekit server 的 `device_model` 字段
+- 重试 backoff <1 秒（比 plan.md 期望更激进）
+
+### [Phase 5b 阻塞点]
+
+需要 user 提供：(a) livekit server URL（cloud.livekit.io 免费层 / 自建 docker `livekit/livekit-server --dev`），(b) sender + receiver 两个 JWT token（同一 room，identity 不同）。拿到后我跑：
+
+```bash
+ssh rv1126b-board 'cd /opt/livekit && \
+  LD_LIBRARY_PATH=/opt/livekit RUST_LOG=info \
+  LIVEKIT_URL=<wss-url> LIVEKIT_RECEIVER_TOKEN=<jwt> \
+  LIVEKIT_SENDER_IDENTITY=<sender-id> \
+  ./HelloLivekitReceiver'
+```
+
+并行在笔电/VM 上跑 sender。Go 标准：30 秒 Opus 音频 + 数据通道无崩溃。

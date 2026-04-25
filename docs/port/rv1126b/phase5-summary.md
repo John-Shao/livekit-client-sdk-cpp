@@ -1,9 +1,23 @@
-# Phase 5 工作总结 — 板端首次联调 ✅
+# Phase 5 工作总结 — 板端首次联调
 
-> **状态**：完成（双向音视频 140 秒稳定通话；Go 标准 30s 通话超额完成 4.6×）
-> 完成日期：2026-04-25
+> **状态**（更新）：协议层 + 音频下行通了；硬件 I/O 三路（V4L2 capture / DRM render / ALSA capture）尚待补做
+> 起始日期：2026-04-25
 > 分支：`port/rv1126b-phase-0-recon`
 > 关联文档：[plan.md §Phase 5](plan.md) · [phase4-summary.md](phase4-summary.md) · [oplog.md](oplog.md) · `examples/board_loopback/main.cpp`
+
+## 范围澄清（Phase 5 vs Phase 6）
+
+经讨论，Phase 5 / Phase 6 的边界**不是"软编 vs 硬编"**而是 **"协议 + 硬件 I/O" vs "MPP codec 替换"**：
+
+- **libwebrtc 内置软编（VP8/Opus）从 Phase 0 起就一直在 A53 上跑**，"软件编解码"不是单独要做的事
+- **Phase 5 真正需要做的是连接硬件 I/O**：
+  - (a) `/dev/video-camera0` V4L2 摄像头采集 → libwebrtc 软编
+  - (b) libwebrtc 软解 → DRM/KMS 屏幕渲染
+  - (c) ALSA 麦克风采集 → libwebrtc 软编
+  - (d) libwebrtc 软解 → ALSA 扬声器播放（**已完成**）
+- **Phase 6 是把中间 codec 路径换成 MPP**（VEPU/VDPU 硬件编解码），capture/render/playback 不变
+
+按这个边界，BoardLoopback 当前是 Phase 5 的**部分**：协议栈 + 音频下行通了，但视频上行（合成渐变占位）、视频下行（仅计数不渲染）、音频上行（合成 440Hz 占位）都不是真硬件。
 
 ## 子阶段拆分
 
@@ -188,7 +202,7 @@ final  video=3966 audio=14087    ← 14087 / 140 = 100.6 frames/s 完美 10ms ca
 | **板上扬声器播放手机音频** | ✓ 用户主观判定改善后接受 |
 | 中断重连恢复 | ✓ `onParticipantDisconnected/Connected` 自动重订阅 |
 | 140s 持续无 crash | ✓ |
-| Go 标准 30s 音频通话 | ✓✓✓ 4.6× 超额 |
+| Go 标准 30s 音频通话（协议层）| ✓ 持续 140s 不崩；但音频上行是合成正弦，**非真麦** |
 
 ### 5b.6 已知 polish 项
 
@@ -200,11 +214,38 @@ final  video=3966 audio=14087    ← 14087 / 140 = 100.6 frames/s 完美 10ms ca
 | 板上麦克风 capture（双向真互动）| 未做 | 板上 ES8389 同时支持 capture（§2.3）。要让板子的麦音上行，需要给 BoardLoopback 加 ALSA capture 线程 + 喂给 `AudioSource::captureFrame`。Phase 6 / 后续 polish |
 | Native MPP 硬件编解码 | 未做 | 当前走 libwebrtc 自带软编（VP8/Opus）。A53 软编 480p30 / 720p15 可承受。MPP 集成是 Phase 6 |
 
-## Phase 6 切入
+## Phase 5 剩余工作（a / b / c）
 
-Phase 5 用软编（libwebrtc 内置 VP8 + Opus）。Phase 6 性能优化分两路：
-1. **MPP 硬件编解码**：把视频编/解码替换成 `librockchip_mpp` 硬件路径（VEPU/VDPU），CPU 占用大幅下降，可上 720p30/1080p15
-2. **板上麦风采集**：ES8389 capture 经 ALSA → `AudioSource::captureFrame` → 真双向语音
-3. **DRM/KMS 直接渲染**：`liblivekit_ffi.so` 解码出 YUV → RGA 转换 → DRM plane overlay（无 EGL 软渲染开销）
+按上面"范围澄清"的边界，下面三件让 Phase 5 真正闭环：
 
-参考 plan.md §Phase 6 + facts.md §2.7 (b/h)。
+### (c) ALSA 麦克风 capture（最小、做先 — 让板子真"开口"）
+- ES8389 codec capture path 经 ALSA `default` 设备读 PCM16 48kHz mono 10ms 帧
+- 喂给 `AudioSource::captureFrame` → 替换当前的 440Hz 合成正弦
+- 估计 ~100 行：`snd_pcm_open(... CAPTURE)` + `snd_pcm_readi` 线程 + 写入 SDK
+- 风险：跟现有 ALSA playback 共用 ES8389 时硬件路由（pulse 介入），可能要 `default` 而非 `plughw:0,0`
+
+### (b) V4L2 摄像头 capture
+- `/dev/video-camera0` symlink → `/dev/video23`（rkisp_mainpath）
+- 默认 640×480 NV16，需要转 SDK 期望的 RGBA 或 NV12（`VideoFrame::create` 支持的 format）
+- 估计 ~150 行：`v4l2_capability` query → `VIDIOC_S_FMT` → mmap 多 buffer → DQBUF/QBUF 循环 + 颜色转换
+- 复杂点：rkisp_v11 是 ISP 流水线，可能需要先配 sensor / link → mainpath 才能拉流。`/dev/video-camera0` 已经是 mainpath 终端，应该直接读就行
+
+### (a) DRM/KMS 视频渲染
+- `/dev/dri/card0` + `/dev/dri/renderD128`（无 Mali，纯 KMS）
+- libwebrtc 解码出 YUV（一般 NV12 或 I420）→ 直接 import 成 DRM framebuffer → 设到 plane → page-flip
+- 估计 ~200-300 行：drmModeAddFB2 / drmModeSetPlane / 双缓冲 page-flip
+- 不走 EGL（没 Mali 硬件 GL），纯 2D plane 合成
+
+**先做 (c)** —— 风险最低，做完"对着板子讲话→对方听见+看见自己说话"的体验闭环就成立。然后 (b)，最后 (a)。
+
+---
+
+## Phase 6 切入（Phase 5 a/b/c 完成后）
+
+把中间 codec 路径换成 MPP：
+1. **VP8 编解码 → MPP H.264 硬编硬解**（VEPU/VDPU）
+2. **WebRTC 编解码外挂 hook**：libwebrtc 支持 vendor 自定义 encoder（参考 NVidia / VAAPI 的方式，见 `webrtc-sys/build.rs:212-244` CUDA 块的实现）
+3. **零拷贝路径**：V4L2 capture 出的 dmabuf → 直接喂 MPP 编 → 不经 CPU；MPP 解出的 dmabuf → 直接 DRM plane → 不经 CPU
+4. **rkrga 色彩转换**：摄像头 NV16 → MPP 期望的 NV12，用 RGA 硬件做（已知 librga 在 sysroot）
+
+参考 plan.md §Phase 6 三选一（MPP 直接 / Rockit / GStreamer 插件），结合 facts.md §2.7 (b/g/h) 硬件路径事实。

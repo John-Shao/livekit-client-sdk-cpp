@@ -767,6 +767,28 @@ $ ssh rv1126b-board ldd /opt/livekit/BoardLoopback | grep rockchip
 - **CBR 收敛慢**：startBitrate 来自 libwebrtc，初始可能 200~400kbps，太低 MPP 会塞高 QP（51）出渣画质。可以观察前 1s qp_init 表现。
 - **block timeout 配 MPP_POLL_BLOCK**：encode_put_frame 必须先 set timeout 否则 encode_get_packet 立刻返 timeout。已设。
 
+#### [33.9] 端到端 smoke v9 → v10：MPP 真接通了
+
+`BOARD_LOOPBACK_USE_MPP=1` + 24h token，板上跑 35s。
+
+**v9 结果（9419bfc）**：能编，但每帧 2-3 个 leak warning。MPP 自己的日志确认 `set prep cfg w:h [320:240] stride [320:240] fmt 0`（NV12）+ `set rc cbr bps [225000:239062:210937] fps [20:1:fix] gop 40`，完全是我们配的参数。30s 902 帧稳定 publish。但 log 里堆成千上万行：
+```
+mpp_buffer: mpp_buffer_ref_dec buffer from initMppContext found non-positive ref_count 0 caller mpp_packet_deinit
+mpp_meta: put_meta invalid negative ref_count -1
+mpp_mem_pool: mpp_mem_pool_put invalid mem pool ptr ... check (nil)
+```
+
+**根因**：`Encode()` 里我用 `out_pkt`（pre-bind 给 frame meta 的 KEY_OUTPUT_PACKET）和 `got_pkt`（`encode_get_packet(&got_pkt)` 出来的）当两个变量。但 MPP 通过同一个变量传递所有权 —— `mpi_enc_test.c` 里就是 `MppPacket packet` 一个变量复用整条链路。我们 deinit 两次，ref_count 跳到 -1。
+
+**修复**（commit `f30bac5`）：合二为一，单一 `MppPacket packet` 变量；`encode_get_packet(&packet)` 复用同一变量；末尾只 deinit 一次。
+
+**v10 结果**：log 从 2119 行掉到 141 行，**0 个 leak warning**，30s 902 帧稳跑，MPP rc cbr cfg 42 次合理 BWE 更新（225k → 187k → 213k → 215k）。手机中途断连重连，板子优雅承接新 track。
+
+**待手机端确认**：(a) 是否看到板子摄像头实拍画面；(b) WebRTC stats 里 `outboundRtp.encoderImplementation` 是否 `RockchipMpp_H264`（如果还是 `OpenH264` 说明 IsSupported() 没过 —— 但板上 `/dev/mpp_service` 在、env `BOARD_LOOPBACK_USE_MPP=1` 设了，应该能走我们的 factory）。
+
+**注**：libwebrtc 本身的 `RTC_LOG(LS_INFO) << "[mpp] InitEncode ..."` 没出现在 stderr，因为这个 build 没把 RTC_LOG 路由到 stdout（默认走 syslog 或丢弃）。MPP 自己的 `mpp[3908]: ...` 日志倒是直出 stderr，已经够诊断。
+
+
 
 
 参考 plan.md §Phase 6 (3 选 1：MPP 直接 / Rockit / GStreamer 插件) + facts.md §2.7 (b/g/h)。

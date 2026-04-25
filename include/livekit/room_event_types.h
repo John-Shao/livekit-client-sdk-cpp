@@ -34,7 +34,18 @@ class LocalTrackPublication;
 class RemoteTrackPublication;
 class TrackPublication;
 
-enum class VideoCodec;
+// Numeric values mirror livekit/protocol's enum VideoCodec (see
+// livekit-ffi/protocol/video_frame.proto). room_proto_converter.cpp
+// static_cast's between this and proto::VideoCodec, so they MUST stay
+// in sync.
+enum class VideoCodec : int {
+  VP8 = 0,
+  H264 = 1,
+  AV1 = 2,
+  VP9 = 3,
+  H265 = 4,
+};
+
 enum class TrackSource;
 
 /**

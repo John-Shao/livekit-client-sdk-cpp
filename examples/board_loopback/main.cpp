@@ -631,6 +631,13 @@ public:
   }
 
   void renderNV12(const std::uint8_t *src, int src_w, int src_h) {
+    // Simulcast/adaptive bitrate 的最低层有时会塌到 8x8 之类极小尺寸，
+    // 拉伸到 720x1280 倍率超过 driver 的合法上限（drmModeSetPlane 报
+    // EOVERFLOW），后续 frame 也连环失败。设个最小阈值丢弃这类帧，
+    // 让屏幕保留上一可用帧。
+    if (src_w < 64 || src_h < 64) {
+      return;
+    }
     if (!ensureBuffers(src_w, src_h))
       return;
     DumbBuf &b = bufs_[next_];
@@ -909,10 +916,31 @@ int main(int argc, char *argv[]) {
     }
   }
   auto video_source = std::make_shared<VideoSource>(video_w, video_h);
-  std::shared_ptr<LocalVideoTrack> video_track = lp->publishVideoTrack(
-      kVideoTrackName, video_source, TrackSource::SOURCE_CAMERA);
+  // Phase 6 prep: 显式声明 H.264 编码（默认 SDP 协商优先 VP8 因为 livekit-ffi
+  // 的 codec template 顺序 VP8 → H.264 → AV1 → VP9，发布端要主动指定 H.264 才能
+  // 跟 RV1126B MPP 编码器匹配。BOARD_LOOPBACK_VIDEO_CODEC=vp8/h264/h265 可调。
+  livekit::VideoCodec vc = livekit::VideoCodec::H264;
+  if (const char *vc_env = std::getenv("BOARD_LOOPBACK_VIDEO_CODEC")) {
+    std::string s(vc_env);
+    if (s == "vp8") vc = livekit::VideoCodec::VP8;
+    else if (s == "vp9") vc = livekit::VideoCodec::VP9;
+    else if (s == "h265") vc = livekit::VideoCodec::H265;
+    else if (s == "av1") vc = livekit::VideoCodec::AV1;
+    // h264 is default
+  }
+  const char *vc_name = (vc == livekit::VideoCodec::H264) ? "H264"
+                      : (vc == livekit::VideoCodec::VP8)  ? "VP8"
+                      : (vc == livekit::VideoCodec::VP9)  ? "VP9"
+                      : (vc == livekit::VideoCodec::H265) ? "H265"
+                      :                                    "AV1";
+  auto video_track = LocalVideoTrack::createLocalVideoTrack(
+      kVideoTrackName, video_source);
+  TrackPublishOptions vopts_pub;
+  vopts_pub.source = TrackSource::SOURCE_CAMERA;
+  vopts_pub.video_codec = vc;
+  lp->publishTrack(video_track, vopts_pub);
   std::cout << "[loopback] publishing video '" << kVideoTrackName << "' "
-            << video_w << "x" << video_h << " ("
+            << video_w << "x" << video_h << " codec=" << vc_name << " ("
             << (v4l2 ? "live camera NV12" : "synth gradient RGBA") << ")\n";
 
   // Publish audio from the board's real microphone (ES8389 codec capture

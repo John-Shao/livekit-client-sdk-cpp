@@ -310,11 +310,117 @@ glib / gobject / gio 2.76.1 三兄弟 .pc + .so 全在 ✓。
 
 **未提交 submodule gitlink**，等 Phase 3 CMake 实际编译通过后再 pin 到验证过的 commit。
 
-### [Phase 2 切入建议]
+### [16] Phase 2 — VM host 工具与 env 脚本
 
-1. VM 上装 `rustup` + `aarch64-unknown-linux-gnu` target：`curl https://sh.rustup.rs | sh && rustup target add aarch64-unknown-linux-gnu`
-2. 创建 `client-sdk-rust/.cargo/config.toml` + `scripts/env-rv1126b.sh`（参见 [plan.md §Phase 2](plan.md#phase-2--rust-交叉编译工具链05-1-天)）
-3. 把 Buildroot toolchain 从 VM 导出为可移动 tarball（或者直接用 VM 上原地 sysroot）
-4. 先 `cargo build -p webrtc-sys --target aarch64-unknown-linux-gnu` 验证 prebuilt 下载 + 头依赖解析走通，再编整个 livekit-ffi
+VM 装齐 Phase 2 host 依赖（用户在 VM 终端交互式跑，避免 ssh 非 tty sudo 问题）：
 
-推进时间预估：Rust toolchain + 首次 webrtc-sys 编译 = 0.5-1 天（plan.md 原估）
+```bash
+sudo apt install -y protobuf-compiler lld           # focal 自带 lld 10
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+  -y --default-toolchain stable --profile minimal
+. $HOME/.cargo/env
+rustup target add aarch64-unknown-linux-gnu
+```
+
+工具版本：rustc 1.95.0 / cargo 1.95.0 / lld 10 / protoc 3.21.12（PATH 实际取的非 apt 包，更新）。
+
+写 `scripts/env-rv1126b.sh`（commit `71234d6`），核心设计：
+
+- **不修 `client-sdk-rust/.cargo/config.toml`**（上游已有 `-fuse-ld=lld`），仅用 env 变量补 linker/ar：`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-buildroot-linux-gnu-gcc`
+- pkg-config 走 `PKG_CONFIG_SYSROOT_DIR` 指向 Buildroot sysroot
+- bindgen 走 `BINDGEN_EXTRA_CLANG_ARGS=--sysroot=...`（libclang 不读 gcc 内置 sysroot）
+
+`client-sdk-rust` 不再 git clone，直接从 Windows 仓库 scp 50MB 过去（VM 到 GitHub 的 git-https TLS 抖，复用已知好的 fd3df87 副本）。
+
+### [17] livekit-api smoke build（plan.md Go 标准）
+
+**首跑失败但被掩盖**：`ssh rv1126b-vm 'cargo build ...'` 中 cargo 找不到（非交互 ssh 不读 `.bashrc`，rustup 装的 `~/.cargo/bin` 不在 PATH），但 tee 管道 exit 0。
+
+**修法**：env-rv1126b.sh 显式 `. $HOME/.cargo/env`（commit `a48c5ba`）。
+
+**二跑通过**：
+
+```
+$ source scripts/env-rv1126b.sh && cd client-sdk-rust
+$ cargo build --target aarch64-unknown-linux-gnu -p livekit-api
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.77s
+```
+
+抽 `.o` 验证：`ELF 64-bit LSB relocatable, ARM aarch64`。**Phase 2 plan.md Go 标准达成 ✓**。
+
+### [18] webrtc-sys 加码 smoke：158MB prebuilt 下载三轮战
+
+Phase 2 plan.md 没强制要求，但 webrtc-sys 是 Phase 3 livekit-ffi 必经。提前打。
+
+**第一轮**：`cargo build -p webrtc-sys` → build.rs 内嵌的 `reqwest::blocking::get(...)` 拉 prebuilt 在 67MB/158MB **卡死 18 分钟**（国内 → `release-assets.githubusercontent.com` TCP reset，futex_wait_queue_me 无返回）。
+
+**第二轮**：kill 卡死进程后用 VM `wget --tries=50 --continue` 拉到 130MB **wget 报 exit 0** 但文件实际不全。原因：GitHub release-assets 用**签名 URL，30 分钟过期**。wget 抓到 302 目标后一直用旧签名续传，过期后 HTTP 403 `Server failed to authenticate`，wget 把 403 当成"任务完成"。`unzip -t` 直接爆"central directory not found"。
+
+**第三轮**（成功）：外层 shell 循环 + `wget -c <原始 github.com URL>`，每轮自动走 302 拿新签名：
+
+```bash
+while [ "$(wc -c < /tmp/.../webrtc.zip 2>/dev/null || echo 0)" -lt 165522664 ]; do
+  wget --tries=20 --continue "https://github.com/livekit/rust-sdks/releases/download/webrtc-7af9351/webrtc-linux-arm64-release.zip" -O /tmp/.../webrtc.zip
+  sleep 2
+done
+```
+
+最终 165,522,664 B 完整，`unzip -t` 通过。展开到 `~/webrtc-prebuilt/linux-arm64-release/`（含 54MB `libwebrtc.a` + ninja + headers）。
+
+**绕过 build.rs 内嵌下载**：env-rv1126b.sh 加自动检测（commit `c6f1263`），若 `~/webrtc-prebuilt/linux-arm64-release/lib/libwebrtc.a` 存在，自动 export `LK_CUSTOM_WEBRTC=$HOME/webrtc-prebuilt/linux-arm64-release` —— `webrtc_sys_build::custom_dir()` 直接命中本地路径，跳过 `download_webrtc()`。
+
+**编译结果**：
+
+```
+   Compiling webrtc-sys v0.3.28 (...)
+warning: webrtc-sys@0.3.28: cuda.h not found; building without ...
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.25s
+```
+
+0 errors，3 条无害 warning（cuda.h 缺失/upstream workspace profile/ort-tract semver 元数据）。产物 `libwebrtc_sys-*.rlib` 109 MB（内嵌 libwebrtc.a），抽 `.o` 验证 aarch64 ELF ✓。
+
+**Phase 3 最大前置坑全部扫掉**：cxx-build C++20 / pkg-config glib-2.76.1 / lld 链接 / `LK_CUSTOM_WEBRTC` 机制 全证可用。
+
+### [19] client-sdk-rust submodule pin
+
+Phase 2 加码全过，`fd3df87` 是"已知编通的快照"，正式 pin 成 submodule gitlink。
+
+`.gitmodules` 早就声明了 client-sdk-rust 但从未提交 gitlink，工作树里的 `client-sdk-rust/.git` 还是 manual clone 的真目录（不是 submodule 标准的 gitfile）。**`git submodule add -f` 会因为目录已存在失败**。正确路径：
+
+```bash
+git submodule init                                           # 把 .gitmodules 注入 .git/config
+git update-index --add --cacheinfo \
+  160000,fd3df87386cd0abd66fcc0e1dcc15f93235e56d2,client-sdk-rust  # 直接写 gitlink
+git submodule absorbgitdirs client-sdk-rust                  # client-sdk-rust/.git → ../.git/modules/client-sdk-rust
+git commit -m "chore: pin client-sdk-rust submodule to fd3df87"
+git push
+```
+
+commit `b29f310`，diff 仅一行：
+
+```
+new file mode 160000
++Subproject commit fd3df87386cd0abd66fcc0e1dcc15f93235e56d2
+```
+
+之后任何 fresh clone 都能用 plan.md / README_BUILD.md 描述的标准路径：`git submodule update --init --recursive`。
+
+### [20] GitHub Desktop 切分支误报（已纠错）
+
+切到 `main` 分支时 GitHub Desktop 报"1 changed file: client-sdk-rust"，弹"Switch branch / Leave my changes / Bring my changes"对话框。
+
+**根因**：`main` 的 tree 里没声明 client-sdk-rust（也没 `.gitmodules`），但工作树里物理目录还在 → git 视为 untracked。submodule 是 port 分支独有的概念。
+
+**正确处理**：Cancel 对话框 → CLI `git checkout port/rv1126b-phase-0-recon` → submodule 立即被识别，工作树干净。
+
+**后续避坑**：分支切换尽量走 CLI，或者全程别离开 `port/rv1126b-phase-0-recon`（main 留作上游对照即可）。
+
+### [Phase 3 切入建议]
+
+1. **VM 同步 submodule pin**：`cd ~/livekit/livekit-sdk-cpp-0.3.3 && git pull && rm -rf client-sdk-rust .git/modules/client-sdk-rust && git submodule update --init --recursive`（之前 VM 是 scp 来的副本，现在用标准 submodule 模式重挂）
+2. **CMake cross 配置**：写 `cmake/toolchain-rv1126b.cmake` 指向 Buildroot toolchain，再 `cmake -B build-rv1126b -DCMAKE_TOOLCHAIN_FILE=...`
+3. **livekit-ffi 是 CMake 编 cargo 的入口**：先在 VM 上 `cargo build -p livekit-ffi --target aarch64-unknown-linux-gnu` 独立跑通（连锁编 livekit + webrtc-sys，确认更上层 crate 集合也无 cross 兼容问题）
+4. **C++ 端 link 阶段是终极考验**：libwebrtc.a + livekit_ffi.a 两个大库一起喂给 lld，看是否有 abseil/protobuf/openssl 符号冲突或 GCC 13 ABI 不兼容
+5. 坑点预期：`cxx` 生成的桥接代码 vs Buildroot sysroot 的 libstdc++ ABI（理论同 GCC 13 应一致）/ bindgen 解析 sysroot 头时 multi-arch 路径不存在的兼容性
+
+预计耗时：1–2 天（plan.md 原估）。

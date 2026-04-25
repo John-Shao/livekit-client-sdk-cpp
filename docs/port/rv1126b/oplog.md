@@ -497,11 +497,46 @@ cmake --build . --target protoc -j
 
 commit `ebbbb64`：CMakeLists.txt + cmake/protobuf.cmake + scripts/env-rv1126b.sh 三处源改动一并提交。
 
-### [Phase 4 切入建议]
+### [28] Phase 4 — 依赖审计 + 板端 dry-run
 
-1. **板上 SO 依赖核对**：`aarch64-buildroot-linux-gnu-readelf -d build-rv1126b/lib/liblivekit.so | grep NEEDED` → 跟 `ssh rv1126b-board ldconfig -p` 输出比对，缺啥列下来
-2. **scp dry-run**：把 `liblivekit.so` + 一个 `HelloLivekit*` example + 必要 SDL3.so 推到板上 `/tmp`，`LD_LIBRARY_PATH=. ./HelloLivekitReceiver` 看启动
-3. **不必烧固件**：板子已有 rootfs 跟 VM 编出来 ABI 同源（同 `-g4a1fe4ec`），library overlay 测试就够看初步问题
-4. **真正烧版本是 Phase 5**
+`aarch64-buildroot-linux-gnu-readelf -d` 扫 Phase 3 三个产物的 NEEDED：合计仅 9 个（`linux-vdso` + 7 个标准 C/C++ runtime + `libssl`/`libcrypto` 3.x），webrtc-sys 的 X11/glib/drm/gbm 等已经走静态 + lazy `dlopen` stub。详见 [phase4-summary.md](phase4-summary.md) §依赖审计。
 
-预计耗时：0.5–2 天（plan.md 原估，看 rootfs 缺什么需要 buildroot 重编多少）。
+板上覆盖 100%：
+
+```bash
+ssh rv1126b-board 'for lib in libssl.so.3 libcrypto.so.3 libstdc++.so.6 libm.so.6 libgcc_s.so.1 libc.so.6 ld-linux-aarch64.so.1; do
+  P=$(find /lib /usr/lib -maxdepth 2 -name "$lib*" 2>/dev/null | head -1)
+  printf "%-25s %s\n" "$lib" "$P"
+done'
+```
+
+7/7 全部命中（板上 libstdc++.so.6.0.32 与 toolchain `-g4a1fe4ec` 完全同源 minor）。**不需要在 Buildroot defconfig 里加任何包**。
+
+### [29] 板端 dry-run：scp + ldd + 启动入口
+
+VM → 板子 ssh 没免密（之前没配），用 Windows 中转 **stream**：
+
+```bash
+for f in liblivekit.so HelloLivekitSender HelloLivekitReceiver; do
+  ssh rv1126b-vm "cat ~/livekit/livekit-sdk-cpp-0.3.3/build-rv1126b/{lib,bin}/$f" \
+    | ssh rv1126b-board "cat > /tmp/livekit-dryrun/$f"
+done
+ssh rv1126b-vm 'cat ~/livekit/livekit-sdk-cpp-0.3.3/client-sdk-rust/target/aarch64-unknown-linux-gnu/release/deps/liblivekit_ffi.so' \
+  | ssh rv1126b-board 'cat > /tmp/livekit-dryrun/liblivekit_ffi.so'
+```
+
+总 31MB（lib 8.7M / ffi 22M / 二进制 ~30K），板上 `/` 还剩 4.6G 充裕。
+
+`ldd` 在板上跑：所有 NEEDED resolve 通过，无 `not found`。`./HelloLivekitReceiver --help` 进 main() + 打印 usage + `exit(0)` —— 证 livekit C++ + Rust FFI 在 ATK-DLRV1126B 上**完整 load 通过**。
+
+### [Phase 5 切入建议]
+
+板子有 ATK 出厂固件（同 SHA `-g4a1fe4ec` rootfs，dry-run 已证 livekit 二进制可用），**不必烧固件**直接联调 livekit server：
+
+1. 起一台 livekit server（livekit-cloud 或自建 K8s 部署），拿 ws-url + JWT
+2. 在板上 `LIVEKIT_URL=wss://... LIVEKIT_RECEIVER_TOKEN=... ./HelloLivekitReceiver` 看 RTC 协商
+3. 关注 ICE candidate 收集（板上 wlan0 192.168.10.236 内网 + STUN/TURN）、DTLS-SRTP 协商、SDP 交换
+4. 实际媒体流之前先确认 control plane 能跑通
+5. 媒体流（音视频实际数据） → Phase 5/6 边界，可能需要看 [facts.md](facts.md) §2.7 b/h（V4L2 摄像头 / DRM 渲染）的硬件路径整合
+
+预计耗时：1–2 天（plan.md 原估）。如果 control plane 连不上看 STUN/TURN 配置或防火墙；如果协商通了但媒体 stuck 看 ICE candidate 类型 / SDP codec 协商。

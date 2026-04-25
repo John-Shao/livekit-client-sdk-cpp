@@ -320,13 +320,20 @@ add_executable(BoardLoopback
 
 target_include_directories(BoardLoopback PRIVATE ${EXAMPLES_PRIVATE_INCLUDE_DIRS})
 
-# ALSA for ES8389 codec playback on the target board. Linked unconditionally
-# since this example is only useful on Linux; sysroot must provide libasound.
+# ALSA for ES8389 codec playback + libdrm for KMS plane rendering. Linked
+# unconditionally since this example is only useful on Linux; sysroot must
+# provide libasound and libdrm.
 target_link_libraries(BoardLoopback
   PRIVATE
     livekit
     asound
+    drm
 )
+# libdrm headers live under /usr/include/drm in Buildroot sysroot
+find_path(LIBDRM_INCLUDE_DIR drm.h PATH_SUFFIXES libdrm drm)
+if(LIBDRM_INCLUDE_DIR)
+  target_include_directories(BoardLoopback PRIVATE ${LIBDRM_INCLUDE_DIR})
+endif()
 
 # --- bridge_human_robot examples (robot + human; use livekit_bridge and SDL3) ---
 

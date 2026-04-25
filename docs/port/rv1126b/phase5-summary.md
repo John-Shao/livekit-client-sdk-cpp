@@ -1,7 +1,7 @@
-# Phase 5 工作总结 — 板端首次联调
+# Phase 5 工作总结 — 板端首次联调 ✅
 
-> **状态**（更新）：协议层 + 音频下行通了；硬件 I/O 三路（V4L2 capture / DRM render / ALSA capture）尚待补做
-> 起始日期：2026-04-25
+> **状态**：完整通过（协议层 + 4 路硬件 I/O 全闭环；端到端真双向音视频通话稳定）
+> 完成日期：2026-04-25
 > 分支：`port/rv1126b-phase-0-recon`
 > 关联文档：[plan.md §Phase 5](plan.md) · [phase4-summary.md](phase4-summary.md) · [oplog.md](oplog.md) · `examples/board_loopback/main.cpp`
 
@@ -214,29 +214,70 @@ final  video=3966 audio=14087    ← 14087 / 140 = 100.6 frames/s 完美 10ms ca
 | 板上麦克风 capture（双向真互动）| 未做 | 板上 ES8389 同时支持 capture（§2.3）。要让板子的麦音上行，需要给 BoardLoopback 加 ALSA capture 线程 + 喂给 `AudioSource::captureFrame`。Phase 6 / 后续 polish |
 | Native MPP 硬件编解码 | 未做 | 当前走 libwebrtc 自带软编（VP8/Opus）。A53 软编 480p30 / 720p15 可承受。MPP 集成是 Phase 6 |
 
-## Phase 5 剩余工作（a / b / c）
+## Phase 5 各子项完成情况
 
-按上面"范围澄清"的边界，下面三件让 Phase 5 真正闭环：
+### (c) ALSA 麦克风 capture ✅ 已完成
 
-### (c) ALSA 麦克风 capture（最小、做先 — 让板子真"开口"）
-- ES8389 codec capture path 经 ALSA `default` 设备读 PCM16 48kHz mono 10ms 帧
-- 喂给 `AudioSource::captureFrame` → 替换当前的 440Hz 合成正弦
-- 估计 ~100 行：`snd_pcm_open(... CAPTURE)` + `snd_pcm_readi` 线程 + 写入 SDK
-- 风险：跟现有 ALSA playback 共用 ES8389 时硬件路由（pulse 介入），可能要 `default` 而非 `plughw:0,0`
+ES8389 codec capture 经 ALSA `default` 设备读 PCM16 48kHz mono 10ms 帧 → `AudioSource::captureFrame`。
 
-### (b) V4L2 摄像头 capture
-- `/dev/video-camera0` symlink → `/dev/video23`（rkisp_mainpath）
-- 默认 640×480 NV16，需要转 SDK 期望的 RGBA 或 NV12（`VideoFrame::create` 支持的 format）
-- 估计 ~150 行：`v4l2_capability` query → `VIDIOC_S_FMT` → mmap 多 buffer → DQBUF/QBUF 循环 + 颜色转换
-- 复杂点：rkisp_v11 是 ISP 流水线，可能需要先配 sensor / link → mainpath 才能拉流。`/dev/video-camera0` 已经是 mainpath 终端，应该直接读就行
+**坑/经验**：板载 mic 默认增益偏低，加纯软件 gain（默认 12×，env `BOARD_LOOPBACK_MIC_GAIN` 可调）后清晰可辨。`default` 设备走 PulseAudio，`plughw:0,0` 直通会跟 pulse 抢硬件（实测音质差）。
 
-### (a) DRM/KMS 视频渲染
-- `/dev/dri/card0` + `/dev/dri/renderD128`（无 Mali，纯 KMS）
-- libwebrtc 解码出 YUV（一般 NV12 或 I420）→ 直接 import 成 DRM framebuffer → 设到 plane → page-flip
-- 估计 ~200-300 行：drmModeAddFB2 / drmModeSetPlane / 双缓冲 page-flip
-- 不走 EGL（没 Mali 硬件 GL），纯 2D plane 合成
+### (b) V4L2 摄像头 capture ✅ 已完成
 
-**先做 (c)** —— 风险最低，做完"对着板子讲话→对方听见+看见自己说话"的体验闭环就成立。然后 (b)，最后 (a)。
+`/dev/video-camera0` (rkisp_mainpath) NV12 multiplanar，4 个 mmap buffer，poll/DQBUF/QBUF 循环。驱动默认就是 NV12 320×240，零格式转换直接喂 SDK。
+
+**坑/经验**：rkisp_v11 是 multiplanar driver，`v4l2_buffer.m.planes[]` 数组要正确填，否则 `QUERYBUF/QBUF` 都报 EINVAL。30 fps 实测稳定。
+
+### (a) DRM/KMS 显示 ✅ 已完成
+
+`/dev/dri/card0` 上 `DSI-1` connector + plane 74（NV12-capable），双 dumb buffer 双缓冲，drmModeSetPlane 把帧拉伸到 720×1280 全屏。
+
+**坑/经验**（按发现顺序）：
+1. **weston 占着 DRM master** — `drmSetMaster` 失败。修法：跑前 `pkill weston`
+2. **SDK callback 默认给 RGBA**，DRM 要 NV12 → 设 `VideoStream::Options.format = VideoBufferType::I420`（NV12 不被 FFI convert pipeline 支持，I420 是稳的）
+3. **手动 I420 → NV12 软转换**：Y 平面 memcpy + UV 按 U-V 配对插值（~20 行 thread_local 缓冲）
+4. **手机端 simulcast / adaptive bitrate** 中途切换分辨率（360×640 → 720×1280 → 180×320），`ensureBuffers` 检测维度变化重新分配 dumb buffer，**显示不中断**
+
+## 实测：板↔手机端到端 65 秒双向通话
+
+```
+[drm] connector 96 720x1280@60Hz
+[drm] using plane 74 (NV12)
+[drm] dumb buffers ready: 2x 360x640 NV12        ← 自适应分配
+[loopback] T+5s..T+65s  alsa_underruns=0 alsa_dropped=0
+final  video=1776 audio=6188
+```
+
+| 维度 | 实测 |
+|---|---|
+| Board → phone 视频（rkisp 摄像头）| 30 fps，手机端可见摄像头实拍 |
+| Board → phone 音频（ES8389 麦克风）| 12× gain 后人声清晰 |
+| Phone → board 视频（MIPI 屏渲染）| 27-30 fps，画面跟随手机摄像头 |
+| Phone → board 音频（ALSA 播放）| 100 frames/s，1s ALSA buffer 0 underrun |
+| 自适应分辨率切换 | 板上显示无中断，buffer 自动重分配 |
+| 65 秒持续运行 | 0 错误，0 crash，干净退出 |
+
+## 运行手册（Phase 5 production-ready 命令）
+
+```bash
+# 板上（ATK-DLRV1126B）：
+pkill weston                               # 让出 DRM master
+cd /opt/livekit
+LD_LIBRARY_PATH=/opt/livekit RUST_LOG=warn \
+  LIVEKIT_URL=wss://<your-server> \
+  LIVEKIT_TOKEN=<jwt> \
+  ./BoardLoopback
+# Ctrl-C 停；要恢复 weston 用 systemctl restart weston 或 reboot
+
+# 可调 env：
+#   BOARD_LOOPBACK_MIC_GAIN=N        软件 mic 放大倍数（默认 12）
+#   ALSA_PCM_DEVICE=plughw:0,0       output 设备（默认 default）
+#   ALSA_CAPTURE_DEVICE=plughw:0,0   capture 设备（默认 default）
+#   V4L2_DEVICE=/dev/videoX          摄像头（默认 /dev/video-camera0）
+#   BOARD_LOOPBACK_SYNTH_VIDEO=1     强制合成视频（fallback）
+#   BOARD_LOOPBACK_SYNTH_AUDIO=1     强制合成音频（fallback）
+#   BOARD_LOOPBACK_NO_DRM=1          跳过 DRM 渲染（headless 模式）
+```
 
 ---
 

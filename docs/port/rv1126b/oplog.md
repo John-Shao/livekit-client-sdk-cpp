@@ -632,14 +632,51 @@ final  video=3966 audio=14087    ← 14087/140s = 100.6/s 完美 10ms cadence
 - 板↔手机双向音视频都通
 - 中间无 crash
 
+### [32] Phase 5 重新定义：协议 + 4 路硬件 I/O 全闭环
+
+经讨论 Phase 5 / Phase 6 的边界：**不是"软编 vs 硬编"，是"协议 + 硬件 I/O" vs "MPP codec 替换"**。libwebrtc 软编从 Phase 0 就在跑（免费跟着来）。Phase 5 真正缺的是 4 路硬件 I/O：
+
+- (a) V4L2 摄像头 → publish
+- (b) DRM/KMS 显示订阅到的视频
+- (c) ALSA 麦克风 → publish
+- (d) ALSA 扬声器 ← 订阅到的音频（[31.4-31.7] 已完成）
+
+#### [32.1] (c) ALSA 麦克风 capture
+`snd_pcm_open(default, CAPTURE)` + `snd_pcm_readi` 480 samples（10ms）+ 软件 gain（默认 12× 经实测板载 mic 最佳）。命中点：板上 PulseAudio 仍在跑，capture 也走 `default` 设备让 pulse 接管，`plughw:0,0` 直通会抢硬件出问题。
+
+#### [32.2] (a) V4L2 摄像头 capture
+`/dev/video-camera0` (rkisp_mainpath) Multiplanar NV12 320×240，4 mmap buffer + poll/DQBUF/QBUF 循环。驱动默认就是 NV12，零格式转换直接 `VideoFrame(w, h, NV12, bytes)` 喂 SDK。30 fps 实测稳定。手机端验证："手机能看到板子摄像头实拍"。
+
+#### [32.3] (b) DRM/KMS 显示
+最有戏的一项。多个坑串联：
+
+1. **weston 占着 DRM master** → `drmSetMaster` 失败。文档化"先 `pkill weston`"
+2. **SDK 默认 callback format=RGBA** → DRM NV12 plane 不接受。改 `VideoStream::Options.format = NV12` → SDK FFI 报"convert to Nv12 not supported"
+3. **改 `format = I420`** → SDK 给我们 I420，自己写 ~20 行 thread_local I420→NV12 软转换（Y 平面 memcpy + UV 按 U-V 插值）
+4. **simulcast adaptive bitrate**：手机中途切分辨率（360×640 → 720×1280 → 180×320），`ensureBuffers` 检测维度变化重分配 dumb buffer，显示不中断
+
+最终：板上 MIPI 屏（DSI-1，720×1280）实时显示手机摄像头画面，全程拉伸到全屏，65s 0 underrun 0 drop 0 crash。
+
+#### [32.4] 端到端通过
+
+`examples/board_loopback/main.cpp` 单进程同时：
+- V4L2 capture 真摄像头 → publish
+- ALSA mic 真麦克风（12× gain）→ publish
+- libwebrtc VP8/Opus 软编 → 上行
+- 订阅手机 video/audio
+- 手机视频 I420 → NV12 → DRM plane → MIPI 屏
+- 手机音频 → ALSA `default` → ES8389 → 喇叭
+
+**plan.md Phase 5 Go 标准实质达成**。
+
 ### [Phase 6 切入建议]
 
-Phase 5 跑的是 libwebrtc 内置软编（VP8 + Opus），CPU A53 × 4 在 480×360 视频 + 音频时已能撑住 140s。Phase 6 优化点：
+Phase 5 用软编（libwebrtc 内置 VP8 + Opus），A53 × 4 在 320×240 ~ 720×1280 都能撑住。Phase 6 性能优化只换 codec 路径（capture/render/playback 不变）：
 
-1. **MPP 硬件编解码**：把视频路径换成 `librockchip_mpp`（VEPU/VDPU），CPU 占用大幅下降
-2. **板上麦风采集**：ES8389 同时支持 capture，加 ALSA capture 线程 → `AudioSource::captureFrame`，板子能"开口说话"上行
-3. **DRM/KMS 直接渲染**：解码 YUV → RGA → DRM plane overlay（avoid EGL 软渲）
-4. **数据通道**：jusiai NAT/防火墙下 SCTP-DTLS 协商超时，需调 server 或绕过 STUN/TURN
-5. **延迟优化**：当前 1s ALSA buffer 容易但延迟感强，MPP 路径稳了之后可缩到 100-200ms
+1. **MPP 硬件编解码**：把 libwebrtc 内置的 VP8 软编/解换成 `librockchip_mpp` (VEPU/VDPU 走 H.264)。需要研究 webrtc-sys 的 `VideoEncoderFactory` 自定义 hook（参考 `webrtc-sys/build.rs:212-244` CUDA 块的实现，把 NVENC 那种集成方式套到 MPP）
+2. **零拷贝路径**：V4L2 capture dmabuf → MPP 编（不经 CPU）；MPP 解 dmabuf → DRM plane（不经 CPU）。需要 dma-buf 句柄打通
+3. **rkrga 色彩转换**：camera 默认 NV12 OK；如果未来需要 NV12 → I420 转换让软编继续工作，用 RGA 硬件而非软件
+4. **数据通道**（已知 polish）：jusiai NAT/防火墙下 SCTP-DTLS 协商超时，BoardLoopback 已移除 data publish；需调 server STUN/TURN
+5. **延迟优化**：当前端到端约 1-1.5 秒（ALSA 1s + RTP/SRTP jitter）。MPP 编解码延迟可比软编低，可缩到 ~500ms
 
-参考 plan.md §Phase 6 (3 选 1：MPP 直接 / Rockit 中间件 / GStreamer 插件)。
+参考 plan.md §Phase 6 (3 选 1：MPP 直接 / Rockit / GStreamer 插件) + facts.md §2.7 (b/g/h)。

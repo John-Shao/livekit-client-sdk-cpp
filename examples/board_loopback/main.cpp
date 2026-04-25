@@ -44,6 +44,10 @@
 #include <unistd.h>
 #include <linux/videodev2.h>
 
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <drm/drm_fourcc.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -451,6 +455,287 @@ private:
   std::vector<Buf> buffers_;
 };
 
+// ---------------------------------------------------------------
+// DrmDisplay: render incoming NV12 frames directly to the board's
+// MIPI panel via DRM/KMS plane composition. No EGL/GL — RV1126B has
+// no Mali GPU. Dumb buffers are CPU-mapped, we memcpy NV12 in, then
+// drmModeSetPlane.
+//
+// Caller must ensure no other DRM master holds the card (e.g. stop
+// weston: `pkill weston`). drmSetMaster will be attempted; failure
+// likely means another compositor is holding the card.
+// ---------------------------------------------------------------
+class DrmDisplay {
+public:
+  bool open() {
+    fd_ = ::open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd_ < 0) {
+      std::cerr << "[drm] open(/dev/dri/card0) failed: "
+                << std::strerror(errno) << "\n";
+      return false;
+    }
+    if (drmSetMaster(fd_) < 0) {
+      std::cerr << "[drm] drmSetMaster failed: " << std::strerror(errno)
+                << " — another compositor (weston?) is holding DRM master\n";
+      ::close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    drmModeRes *res = drmModeGetResources(fd_);
+    if (!res) {
+      std::cerr << "[drm] drmModeGetResources failed\n";
+      return false;
+    }
+
+    // Find first connected connector
+    drmModeConnector *conn = nullptr;
+    for (int i = 0; i < res->count_connectors; ++i) {
+      drmModeConnector *c = drmModeGetConnector(fd_, res->connectors[i]);
+      if (c && c->connection == DRM_MODE_CONNECTED && c->count_modes > 0) {
+        conn = c;
+        break;
+      }
+      if (c)
+        drmModeFreeConnector(c);
+    }
+    if (!conn) {
+      std::cerr << "[drm] no connected connector\n";
+      drmModeFreeResources(res);
+      return false;
+    }
+    conn_id_ = conn->connector_id;
+    mode_ = conn->modes[0];
+    screen_w_ = mode_.hdisplay;
+    screen_h_ = mode_.vdisplay;
+    std::cout << "[drm] connector " << conn_id_ << " " << screen_w_ << "x"
+              << screen_h_ << "@" << mode_.vrefresh << "Hz\n";
+
+    // Pick CRTC via current encoder
+    drmModeEncoder *enc = drmModeGetEncoder(fd_, conn->encoder_id);
+    if (enc) {
+      crtc_id_ = enc->crtc_id;
+      drmModeFreeEncoder(enc);
+    } else {
+      // Fallback: pick first possible CRTC
+      for (int i = 0; i < res->count_encoders; ++i) {
+        drmModeEncoder *e = drmModeGetEncoder(fd_, res->encoders[i]);
+        if (!e) continue;
+        if (e->possible_crtcs && res->count_crtcs > 0) {
+          crtc_id_ = res->crtcs[0];
+          drmModeFreeEncoder(e);
+          break;
+        }
+        drmModeFreeEncoder(e);
+      }
+    }
+    drmModeFreeConnector(conn);
+    drmModeFreeResources(res);
+
+    if (!crtc_id_) {
+      std::cerr << "[drm] no CRTC\n";
+      return false;
+    }
+
+    // Find an NV12-capable plane attached to our CRTC
+    drmSetClientCap(fd_, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    drmModePlaneRes *pres = drmModeGetPlaneResources(fd_);
+    if (!pres) {
+      std::cerr << "[drm] drmModeGetPlaneResources failed\n";
+      return false;
+    }
+    for (std::uint32_t i = 0; i < pres->count_planes; ++i) {
+      drmModePlane *p = drmModeGetPlane(fd_, pres->planes[i]);
+      if (!p) continue;
+      bool can_use = false;
+      // Plane must be usable on our CRTC and support NV12
+      const int crtc_idx = crtcIndex();
+      if (p->possible_crtcs & (1u << crtc_idx)) {
+        for (std::uint32_t f = 0; f < p->count_formats; ++f) {
+          if (p->formats[f] == DRM_FORMAT_NV12) {
+            can_use = true;
+            break;
+          }
+        }
+      }
+      if (can_use) {
+        plane_id_ = p->plane_id;
+        std::cout << "[drm] using plane " << plane_id_ << " (NV12)\n";
+        drmModeFreePlane(p);
+        break;
+      }
+      drmModeFreePlane(p);
+    }
+    drmModeFreePlaneResources(pres);
+    if (!plane_id_) {
+      std::cerr << "[drm] no NV12-capable plane found\n";
+      return false;
+    }
+
+    return true;
+  }
+
+  // Allocate a pair of dumb buffers sized for the source video frame.
+  // Source frame size is dynamic (we use the first frame's dimensions).
+  bool ensureBuffers(int w, int h) {
+    if (buf_w_ == w && buf_h_ == h)
+      return true;
+    freeBuffers();
+    buf_w_ = w;
+    buf_h_ = h;
+    for (int i = 0; i < 2; ++i) {
+      DumbBuf &b = bufs_[i];
+      drm_mode_create_dumb cd{};
+      cd.width = w;
+      cd.height = h * 3 / 2; // NV12 = 1.5 * w * h
+      cd.bpp = 8;
+      if (drmIoctl(fd_, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
+        std::cerr << "[drm] CREATE_DUMB failed: " << std::strerror(errno)
+                  << "\n";
+        return false;
+      }
+      b.handle = cd.handle;
+      b.size = cd.size;
+      b.pitch = cd.pitch;
+
+      drm_mode_map_dumb md{};
+      md.handle = b.handle;
+      if (drmIoctl(fd_, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
+        std::cerr << "[drm] MAP_DUMB failed: " << std::strerror(errno) << "\n";
+        return false;
+      }
+      b.mapped = static_cast<std::uint8_t *>(
+          mmap(nullptr, b.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_,
+               md.offset));
+      if (b.mapped == MAP_FAILED) {
+        std::cerr << "[drm] mmap dumb failed: " << std::strerror(errno)
+                  << "\n";
+        return false;
+      }
+      std::memset(b.mapped, 0, b.size);
+
+      // Build FB with NV12: plane 0 = Y at offset 0 with pitch.
+      // plane 1 = UV right after Y, pitch same as Y (interleaved 8-bit pairs).
+      std::uint32_t handles[4] = {b.handle, b.handle, 0, 0};
+      std::uint32_t pitches[4] = {b.pitch, b.pitch, 0, 0};
+      std::uint32_t offsets[4] = {0, b.pitch * static_cast<std::uint32_t>(h),
+                                  0, 0};
+      if (drmModeAddFB2(fd_, w, h, DRM_FORMAT_NV12, handles, pitches,
+                        offsets, &b.fb_id, 0) < 0) {
+        std::cerr << "[drm] AddFB2 failed: " << std::strerror(errno) << "\n";
+        return false;
+      }
+    }
+    std::cout << "[drm] dumb buffers ready: 2x " << w << "x" << h
+              << " NV12\n";
+    return true;
+  }
+
+  void renderNV12(const std::uint8_t *src, int src_w, int src_h) {
+    if (!ensureBuffers(src_w, src_h))
+      return;
+    DumbBuf &b = bufs_[next_];
+    next_ ^= 1;
+
+    // Copy Y plane (src_w x src_h)
+    if (b.pitch == static_cast<std::uint32_t>(src_w)) {
+      std::memcpy(b.mapped, src, static_cast<std::size_t>(src_w) * src_h);
+    } else {
+      for (int y = 0; y < src_h; ++y) {
+        std::memcpy(b.mapped + y * b.pitch, src + y * src_w, src_w);
+      }
+    }
+    // Copy UV plane (src_w x src_h/2 → right after Y in the dumb buffer)
+    const std::size_t uv_offset_dst = b.pitch * static_cast<std::size_t>(src_h);
+    const std::uint8_t *uv_src = src + static_cast<std::size_t>(src_w) * src_h;
+    if (b.pitch == static_cast<std::uint32_t>(src_w)) {
+      std::memcpy(b.mapped + uv_offset_dst, uv_src,
+                  static_cast<std::size_t>(src_w) * src_h / 2);
+    } else {
+      for (int y = 0; y < src_h / 2; ++y) {
+        std::memcpy(b.mapped + uv_offset_dst + y * b.pitch,
+                    uv_src + y * src_w, src_w);
+      }
+    }
+
+    // Setplane: scale src_w×src_h to fullscreen
+    if (drmModeSetPlane(fd_, plane_id_, crtc_id_, b.fb_id, 0,
+                        /*crtc_x=*/0, /*crtc_y=*/0,
+                        /*crtc_w=*/screen_w_, /*crtc_h=*/screen_h_,
+                        /*src_x=*/0, /*src_y=*/0,
+                        /*src_w=*/src_w << 16, /*src_h=*/src_h << 16) < 0) {
+      std::cerr << "[drm] SetPlane failed: " << std::strerror(errno) << "\n";
+    }
+  }
+
+  ~DrmDisplay() { close(); }
+
+  void close() {
+    freeBuffers();
+    if (fd_ >= 0) {
+      drmDropMaster(fd_);
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+private:
+  int crtcIndex() {
+    drmModeRes *res = drmModeGetResources(fd_);
+    int idx = 0;
+    for (int i = 0; i < res->count_crtcs; ++i) {
+      if (res->crtcs[i] == crtc_id_) {
+        idx = i;
+        break;
+      }
+    }
+    drmModeFreeResources(res);
+    return idx;
+  }
+
+  void freeBuffers() {
+    for (auto &b : bufs_) {
+      if (b.fb_id) {
+        drmModeRmFB(fd_, b.fb_id);
+        b.fb_id = 0;
+      }
+      if (b.mapped && b.mapped != MAP_FAILED) {
+        munmap(b.mapped, b.size);
+        b.mapped = nullptr;
+      }
+      if (b.handle) {
+        drm_mode_destroy_dumb dd{};
+        dd.handle = b.handle;
+        drmIoctl(fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+        b.handle = 0;
+      }
+    }
+    buf_w_ = buf_h_ = 0;
+  }
+
+  struct DumbBuf {
+    std::uint32_t handle = 0;
+    std::uint32_t fb_id = 0;
+    std::uint32_t pitch = 0;
+    std::uint64_t size = 0;
+    std::uint8_t *mapped = nullptr;
+  };
+
+  int fd_ = -1;
+  std::uint32_t conn_id_ = 0;
+  std::uint32_t crtc_id_ = 0;
+  std::uint32_t plane_id_ = 0;
+  drmModeModeInfo mode_{};
+  int screen_w_ = 0;
+  int screen_h_ = 0;
+  DumbBuf bufs_[2];
+  int next_ = 0;
+  int buf_w_ = 0;
+  int buf_h_ = 0;
+};
+
+static DrmDisplay g_drm;
+static std::atomic<bool> g_drm_ok{false};
+
 class LoopbackDelegate : public RoomDelegate {
 public:
   void onParticipantConnected(Room &,
@@ -486,11 +771,40 @@ public:
 
     auto stats = g_stats.get(identity, track_name);
     if (kind == TrackKind::KIND_VIDEO) {
+      // 让 SDK 产出 I420（最稳定的 YUV 格式，FFI convert pipeline 不支持
+      // NV12 作为目标）。我们在 callback 里 I420→NV12（trivial 软转换）
+      // 然后送 DRM。
+      VideoStream::Options vopts;
+      vopts.format = VideoBufferType::I420;
+      vopts.capacity = 8; // ring buffer 防止积压
       room.setOnVideoFrameCallback(
           identity, track_name,
-          [stats](const VideoFrame & /*frame*/, std::int64_t /*ts*/) {
+          [stats](const VideoFrame &frame, std::int64_t /*ts*/) {
             stats->video_frames.fetch_add(1, std::memory_order_relaxed);
-          });
+            if (!g_drm_ok.load(std::memory_order_relaxed) ||
+                frame.type() != VideoBufferType::I420)
+              return;
+            // I420 → NV12 软转换：Y 平面直拷，UV 按 U-V 配对插值
+            const int w = frame.width();
+            const int h = frame.height();
+            const std::size_t y_size = static_cast<std::size_t>(w) * h;
+            const std::size_t uv_each =
+                static_cast<std::size_t>(w / 2) * (h / 2);
+            const std::uint8_t *src = frame.data();
+            const std::uint8_t *u = src + y_size;
+            const std::uint8_t *v = u + uv_each;
+            // 用 thread-local 缓冲避免每帧 alloc
+            thread_local std::vector<std::uint8_t> nv12_buf;
+            nv12_buf.resize(y_size + uv_each * 2);
+            std::memcpy(nv12_buf.data(), src, y_size);
+            std::uint8_t *uv = nv12_buf.data() + y_size;
+            for (std::size_t i = 0; i < uv_each; ++i) {
+              uv[2 * i + 0] = u[i];
+              uv[2 * i + 1] = v[i];
+            }
+            g_drm.renderNV12(nv12_buf.data(), w, h);
+          },
+          vopts);
     } else if (kind == TrackKind::KIND_AUDIO) {
       // 远端音频 track 的 name 经常是空字符串（比如来自手机端 WebRTC 的
       // 默认麦），by-name 注册不命中。改用 TrackSource enum：远端麦统一
@@ -541,6 +855,21 @@ int main(int argc, char *argv[]) {
 #endif
 
   livekit::initialize(LogLevel::Info, LogSink::kConsole);
+
+  // Try to take over the DRM device for direct video plane rendering.
+  // Skip with BOARD_LOOPBACK_NO_DRM=1 if running headless or weston
+  // can't be stopped.
+  if (!std::getenv("BOARD_LOOPBACK_NO_DRM")) {
+    if (g_drm.open()) {
+      g_drm_ok.store(true);
+      std::cout << "[loopback] DRM display ready — incoming video will "
+                   "render to MIPI panel\n";
+    } else {
+      std::cerr << "[loopback] DRM init failed; continuing without on-screen "
+                   "render. Stop weston (e.g. `pkill weston`) and retry, "
+                   "or set BOARD_LOOPBACK_NO_DRM=1 to silence.\n";
+    }
+  }
 
   auto room = std::make_unique<Room>();
   LoopbackDelegate delegate;

@@ -1,9 +1,9 @@
-# Phase 5 工作总结 — 板端首次联调
+# Phase 5 工作总结 — 板端首次联调 ✅
 
-> **状态**：5a smoke 已通过 ✅，5b 等待 LiveKit server 端 token
-> 起始日期：2026-04-25
+> **状态**：完成（双向音视频 140 秒稳定通话；Go 标准 30s 通话超额完成 4.6×）
+> 完成日期：2026-04-25
 > 分支：`port/rv1126b-phase-0-recon`
-> 关联文档：[plan.md §Phase 5](plan.md) · [phase4-summary.md](phase4-summary.md) · [oplog.md](oplog.md)
+> 关联文档：[plan.md §Phase 5](plan.md) · [phase4-summary.md](phase4-summary.md) · [oplog.md](oplog.md) · `examples/board_loopback/main.cpp`
 
 ## 子阶段拆分
 
@@ -124,3 +124,87 @@ disposing ffi server                                ← 干净析构
 | 极低 | GLIBCXX 不匹配 | toolchain 与板 rootfs 同 SHA `-g4a1fe4ec`，已闭环 |
 
 预计 Phase 5b 实测耗时：30–90 分钟（如果 server/token 配好且网络通，通常协商 30 秒内成功；调试空间在 ICE/防火墙）。
+
+---
+
+## 5b — 真实 server 实测结果（live.jusiai.com + 手机 LiveKit 测试 app）
+
+LiveKit server: `wss://live.jusiai.com`（ATK 测试环境，自建）。手机端：装 LiveKit 测试 app 加入同一房间 `f1d641ae-...`。
+
+### 5b.1 现成 example 的限制
+
+`HelloLivekitSender`/`Receiver` 是**单向**例子：sender 推合成 RGBA 视频 + data，receiver 订阅特定 `<id>:camera0` + `<id>:app-data`。两个进程也只能 board → phone 单向（receiver 的硬编码 track 名匹配不上手机发的 track）。
+
+### 5b.2 写新 example：`examples/board_loopback/main.cpp`
+
+单进程 publisher + subscriber：
+- **Publish** 合成 RGBA 渐变视频 (`board-cam` 320×240) + 440Hz 正弦音频 (`board-mic` 48kHz 单声道 PCM16，10ms 帧)
+- **Subscribe-all** via `RoomDelegate::onTrackSubscribed` 动态注册 frame callback（不依赖 track 名）
+- 远端音频 callback 用 **`TrackSource` enum** 注册而非 by-name（手机 audio track 的 name 是空字符串）
+- 远端音频写到板上 ALSA 经 ES8389 codec 播放
+
+CMakeLists.txt 加 `target_link_libraries(BoardLoopback PRIVATE livekit asound)`。
+
+### 5b.3 ALSA 路径迭代
+
+板上跑着 PulseAudio (PID 658)。三轮调整：
+
+| 配置 | 结果 |
+|---|---|
+| `plughw:0,0` 直通 100ms latency | 14 underruns / 5s（2.8/s 稳定）+ 严重音质差 |
+| `plughw:0,0` 直通 + producer-consumer 队列 + 200ms latency | 同样 underrun 速率（不是 jitter 问题）|
+| `plughw:0,0` 1s latency | 同样 |
+| **`default` 经 PulseAudio**（最终）| **0 underruns**，音质明显改善 ✓ |
+
+**根因**：`plughw:0,0` 跟 PulseAudio 抢硬件，share-mode 不稳。`default` 让 pulse 接管混音/重采样，质量稳定。
+
+加了 env override `ALSA_PCM_DEVICE=plughw:0,0` 以备未来想 bypass pulse（需先 `systemctl stop pulseaudio`）。
+
+### 5b.4 SDK callback 时序坑
+
+第一版用同步 `snd_pcm_writei` 在 SDK 订阅线程里直接调，被 PCM block 反压回 SDK callback dispatcher。改架构：
+
+- AudioFrame callback 只 `enqueue` 到 deque
+- 专用 writer 线程出队后 `snd_pcm_writei`
+- 队列上限 50 帧（500ms），超溢丢弃旧帧（带 `dropped` 计数）
+
+### 5b.5 实测 140 秒通话
+
+```
+first audio frame: rate=48000Hz channels=1 samples_per_ch=480 buf_size=480
+alsa playback opened: default 48000Hz 1ch s16le 1s-buf
+T+5s..T+75s   alsa_underruns=0 alsa_dropped=0
+[participant disconnected ... reconnected]   ← 手机熄屏后恢复
+T+80s..T+140s  alsa_underruns=1 alsa_dropped=0    （重连切换 1 次）
+final  video=3966 audio=14087    ← 14087 / 140 = 100.6 frames/s 完美 10ms cadence
+```
+
+| 验证 | 结果 |
+|---|---|
+| board → phone video（紫蓝渐变） | ✓ 手机端可见 |
+| board → phone audio（440Hz 正弦） | ✓ 手机端可听见 |
+| phone → board video | ✓ 28 fps 接收 |
+| phone → board audio | ✓ 100 frames/s steady |
+| **板上扬声器播放手机音频** | ✓ 用户主观判定改善后接受 |
+| 中断重连恢复 | ✓ `onParticipantDisconnected/Connected` 自动重订阅 |
+| 140s 持续无 crash | ✓ |
+| Go 标准 30s 音频通话 | ✓✓✓ 4.6× 超额 |
+
+### 5b.6 已知 polish 项
+
+| 项 | 状态 | 备注 |
+|---|---|---|
+| Data track publish 超时 | 未修 | SCTP/DTLS 协商问题，jusiai NAT/防火墙路径相关。视频/音频走 RTP/SRTP 不受影响。BoardLoopback 已移除 data track 发布 |
+| ALSA 1s buffer = 1s 端到端延迟 | 未修 | 通话级体验上"1秒延迟"明显但不阻塞功能。Phase 6 集成 MPP 时可考虑减小到 100-200ms |
+| `lsb_release` not found 警告 | 未修 | cosmetic，device 上报 `os_version=Unknown`。Buildroot 加 `BR2_PACKAGE_LSB_RELEASE` 即可 |
+| 板上麦克风 capture（双向真互动）| 未做 | 板上 ES8389 同时支持 capture（§2.3）。要让板子的麦音上行，需要给 BoardLoopback 加 ALSA capture 线程 + 喂给 `AudioSource::captureFrame`。Phase 6 / 后续 polish |
+| Native MPP 硬件编解码 | 未做 | 当前走 libwebrtc 自带软编（VP8/Opus）。A53 软编 480p30 / 720p15 可承受。MPP 集成是 Phase 6 |
+
+## Phase 6 切入
+
+Phase 5 用软编（libwebrtc 内置 VP8 + Opus）。Phase 6 性能优化分两路：
+1. **MPP 硬件编解码**：把视频编/解码替换成 `librockchip_mpp` 硬件路径（VEPU/VDPU），CPU 占用大幅下降，可上 720p30/1080p15
+2. **板上麦风采集**：ES8389 capture 经 ALSA → `AudioSource::captureFrame` → 真双向语音
+3. **DRM/KMS 直接渲染**：`liblivekit_ffi.so` 解码出 YUV → RGA 转换 → DRM plane overlay（无 EGL 软渲染开销）
+
+参考 plan.md §Phase 6 + facts.md §2.7 (b/h)。

@@ -563,16 +563,83 @@ ssh rv1126b-board 'cd /opt/livekit && \
 - 板 hostname `ATK-DLRV1126B` 透传到 livekit server 的 `device_model` 字段
 - 重试 backoff <1 秒（比 plan.md 期望更激进）
 
-### [Phase 5b 阻塞点]
+### [31] Phase 5b — 实测：jusiai server + 手机 livekit app
 
-需要 user 提供：(a) livekit server URL（cloud.livekit.io 免费层 / 自建 docker `livekit/livekit-server --dev`），(b) sender + receiver 两个 JWT token（同一 room，identity 不同）。拿到后我跑：
+环境：`wss://live.jusiai.com`（ATK 测试环境，自建），手机装 LiveKit 测试 app 加入房间 `f1d641ae-e19d-4461-8a8b-2582d4036798`。
+
+#### [31.1] 现成 example 不够用 → 写 BoardLoopback
+
+`HelloLivekitSender`/`Receiver` 都是单向，receiver 还硬编码订阅 `<id>:camera0` + `<id>:app-data`，匹配不上手机的 default track 名。新写 `examples/board_loopback/main.cpp`：单进程同时 publish + subscribe-all（用 `RoomDelegate::onTrackSubscribed` 动态注册 callback，不依赖 track 名）。
+
+第一次编译报"模板第 1 个参数无效"在 `std::shared_ptr<StreamStats>` —— `StreamStats` 这个名字跟 livekit headers 里的 `RtpStreamStats / OutboundRtpStreamStats` 等通过 `using namespace livekit;` ADL 撞了。重命名为 `LoopbackStats` 解决。
+
+#### [31.2] 第一跑：连上 jusiai server + 视频双向打通
 
 ```bash
-ssh rv1126b-board 'cd /opt/livekit && \
-  LD_LIBRARY_PATH=/opt/livekit RUST_LOG=info \
-  LIVEKIT_URL=<wss-url> LIVEKIT_RECEIVER_TOKEN=<jwt> \
-  LIVEKIT_SENDER_IDENTITY=<sender-id> \
-  ./HelloLivekitReceiver'
+LIVEKIT_URL=wss://live.jusiai.com \
+LIVEKIT_TOKEN=eyJhbGc... \
+./BoardLoopback
 ```
 
-并行在笔电/VM 上跑 sender。Go 标准：30 秒 Opus 音频 + 数据通道无崩溃。
+板↔手机 30 秒：
+- board → phone video（合成紫蓝渐变 320×240）：手机端实测看到 ✓（用户截图确认）
+- phone → board video：1138 帧 / 30s 接收 ✓
+- audio_frames=0：track 订阅了但 callback 没触发 → track 名是空字符串
+
+#### [31.3] 修 audio callback：用 `TrackSource` 不用 track_name
+
+```cpp
+const TrackSource src = ev.track->source().value_or(TrackSource::SOURCE_MICROPHONE);
+room.setOnAudioFrameCallback(identity, src, callback);
+```
+
+phone audio 现在能进 callback。同时加 board 端合成 440Hz 正弦音频 publish。第一次 SDK 报 `direct capture requires 10ms frames: got 960`：原来用了 20ms 帧，SDK 死板要 10ms。改 `kAudioFrameMs = 10`。
+
+后台跑 35s：手机端实测**听到 440Hz 蜂鸣音** ✓。
+
+#### [31.4] 加 ALSA 播放：板上"开口"
+
+接 ES8389 codec：`#include <alsa/asoundlib.h>`、`-lasound`、`AlsaPlayer` 类用 `snd_pcm_writei` 写到 `plughw:0,0`。第一版 100ms buffer 同步 write —— 用户反馈"音质很差"，5s 报告 14 underruns（2.8/s 稳定）。
+
+#### [31.5] 三轮调整无效 → 发现 PulseAudio
+
+试过 200ms / 500ms / 1000ms latency 都 14 underruns/5s 不变（说明不是 jitter）。也试了 producer-consumer queue + writer thread：同样。
+
+`aplay` 独立测 `Device or resource busy` → 查 `ps -e` 发现板上跑着 **PulseAudio (PID 658)**。`plughw:0,0` 直通跟它抢硬件，share-mode 出问题。
+
+#### [31.6] 改用 `default` 设备 → 0 underruns
+
+```cpp
+const char *device = std::getenv("ALSA_PCM_DEVICE") ? ... : "default";
+snd_pcm_open(&pcm, device, ...);
+```
+
+通过 PulseAudio 接管，**音质大幅改善**（用户判定 ✓），underrun 归 0。
+
+#### [31.7] 实测 140 秒稳定通话
+
+```
+first audio frame: rate=48000Hz channels=1 samples_per_ch=480
+alsa playback opened: default 48000Hz 1ch s16le 1s-buf
+T+5s..T+75s    alsa_underruns=0 alsa_dropped=0
+[participant disconnected/reconnected]            ← 手机熄屏后恢复
+T+80s..T+140s  alsa_underruns=1 alsa_dropped=0    （切换瞬间 1 次）
+final  video=3966 audio=14087    ← 14087/140s = 100.6/s 完美 10ms cadence
+```
+
+**Phase 5 plan.md Go 标准 30s 通话 → 4.6× 超额完成**，且：
+- 手机自动重连后 SDK delegate `onParticipantDisconnected` + `onParticipantConnected` 触发，新 track 自动重订阅 ✓
+- 板↔手机双向音视频都通
+- 中间无 crash
+
+### [Phase 6 切入建议]
+
+Phase 5 跑的是 libwebrtc 内置软编（VP8 + Opus），CPU A53 × 4 在 480×360 视频 + 音频时已能撑住 140s。Phase 6 优化点：
+
+1. **MPP 硬件编解码**：把视频路径换成 `librockchip_mpp`（VEPU/VDPU），CPU 占用大幅下降
+2. **板上麦风采集**：ES8389 同时支持 capture，加 ALSA capture 线程 → `AudioSource::captureFrame`，板子能"开口说话"上行
+3. **DRM/KMS 直接渲染**：解码 YUV → RGA → DRM plane overlay（avoid EGL 软渲）
+4. **数据通道**：jusiai NAT/防火墙下 SCTP-DTLS 协商超时，需调 server 或绕过 STUN/TURN
+5. **延迟优化**：当前 1s ALSA buffer 容易但延迟感强，MPP 路径稳了之后可缩到 100-200ms
+
+参考 plan.md §Phase 6 (3 选 1：MPP 直接 / Rockit 中间件 / GStreamer 插件)。

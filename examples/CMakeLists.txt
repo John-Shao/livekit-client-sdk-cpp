@@ -44,6 +44,7 @@ set(EXAMPLES_ALL
   PingPongPong
   HelloLivekitSender
   HelloLivekitReceiver
+  BoardLoopback
   LoggingLevelsBasicUsage
   LoggingLevelsCustomSinks
   BridgeRobot
@@ -309,6 +310,22 @@ target_include_directories(HelloLivekitReceiver PRIVATE ${EXAMPLES_PRIVATE_INCLU
 target_link_libraries(HelloLivekitReceiver
   PRIVATE
     livekit
+)
+
+# --- board_loopback (RV1126B port: single-process pub + sub-all bidirectional smoke) ---
+
+add_executable(BoardLoopback
+  board_loopback/main.cpp
+)
+
+target_include_directories(BoardLoopback PRIVATE ${EXAMPLES_PRIVATE_INCLUDE_DIRS})
+
+# ALSA for ES8389 codec playback on the target board. Linked unconditionally
+# since this example is only useful on Linux; sysroot must provide libasound.
+target_link_libraries(BoardLoopback
+  PRIVATE
+    livekit
+    asound
 )
 
 # --- bridge_human_robot examples (robot + human; use livekit_bridge and SDL3) ---

@@ -135,8 +135,10 @@ endif()
 # Make abseil available first so protobuf can find absl:: targets.
 FetchContent_MakeAvailable(livekit_abseil)
 
-# Workaround for some abseil flags on Apple Silicon.
-if(APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"))
+# Workaround for some abseil flags on aarch64 (originally Apple Silicon only,
+# but the same x86-only flags appear when cross-compiling abseil for any aarch64
+# target — e.g. Linux aarch64 via Buildroot). Filter unconditionally on aarch64.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
   foreach(t
     absl_random_internal_randen_hwaes_impl
     absl_random_internal_randen_hwaes

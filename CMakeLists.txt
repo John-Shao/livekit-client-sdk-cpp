@@ -163,13 +163,19 @@ find_program(CARGO_EXECUTABLE NAMES cargo REQUIRED)
 
 set(RUST_ROOT ${LIVEKIT_ROOT_DIR}/client-sdk-rust)
 
-# Determine Rust target triple for cross-compilation on macOS
+# Determine Rust target triple for cross-compilation
 set(RUST_TARGET_TRIPLE "")
 if(APPLE AND CMAKE_OSX_ARCHITECTURES)
   if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
     set(RUST_TARGET_TRIPLE "x86_64-apple-darwin")
   elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     set(RUST_TARGET_TRIPLE "aarch64-apple-darwin")
+  endif()
+elseif(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(RUST_TARGET_TRIPLE "aarch64-unknown-linux-gnu")
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
+    set(RUST_TARGET_TRIPLE "armv7-unknown-linux-gnueabihf")
   endif()
 endif()
 
@@ -184,12 +190,27 @@ endif()
 # system libstdc++ lacks symbols like __cxa_call_terminate.
 set(GCC_LIB_DIR "")
 if(NOT WIN32)
-  get_filename_component(_gcc_bin_dir "${CMAKE_C_COMPILER}" DIRECTORY)
-  get_filename_component(_gcc_root "${_gcc_bin_dir}" DIRECTORY)
-  if(IS_DIRECTORY "${_gcc_root}/lib64")
-    set(GCC_LIB_DIR "${_gcc_root}/lib64")
-  elseif(IS_DIRECTORY "${_gcc_root}/lib")
-    set(GCC_LIB_DIR "${_gcc_root}/lib")
+  if(CMAKE_CROSSCOMPILING)
+    # Cross compile: ask GCC where libgcc lives, take its dirname.
+    # Avoids guessing host ${prefix}/lib(64), which is wrong for nested
+    # toolchains like Buildroot's host/usr/bin → host/aarch64-...-gnu/lib.
+    execute_process(
+      COMMAND "${CMAKE_C_COMPILER}" -print-libgcc-file-name
+      OUTPUT_VARIABLE _libgcc_path
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _gcc_query_rv
+    )
+    if(_gcc_query_rv EQUAL 0 AND _libgcc_path)
+      get_filename_component(GCC_LIB_DIR "${_libgcc_path}" DIRECTORY)
+    endif()
+  else()
+    get_filename_component(_gcc_bin_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+    get_filename_component(_gcc_root "${_gcc_bin_dir}" DIRECTORY)
+    if(IS_DIRECTORY "${_gcc_root}/lib64")
+      set(GCC_LIB_DIR "${_gcc_root}/lib64")
+    elseif(IS_DIRECTORY "${_gcc_root}/lib")
+      set(GCC_LIB_DIR "${_gcc_root}/lib")
+    endif()
   endif()
 endif()
 
@@ -219,7 +240,12 @@ message(STATUS \"[run_cargo.cmake] CFG=\${CFG}  CARGO=\${CARGO}  PROTOC=\${PROTO
 set(ENV{PROTOC} \"\${PROTOC_PATH}\")
 
 if(DEFINED GCC_LIB_DIR AND NOT GCC_LIB_DIR STREQUAL \"\")
-  set(ENV{RUSTFLAGS} \"-L \${GCC_LIB_DIR} \$ENV{RUSTFLAGS}\")
+  # 交叉编译时不要往 RUSTFLAGS 注 -L —— 上游 client-sdk-rust/.cargo/config.toml
+  # 的 rustflags 包含 -fuse-ld=lld（链 libwebrtc.a 必需），cargo 对 RUSTFLAGS env 是
+  # 整体覆盖语义会把那一项冲掉。Native 路径保持原行为（修非系统 libstdc++ 缺符号）。
+  if(NOT DEFINED CROSS_COMPILE OR NOT CROSS_COMPILE)
+    set(ENV{RUSTFLAGS} \"-L \${GCC_LIB_DIR} \$ENV{RUSTFLAGS}\")
+  endif()
   set(ENV{LD_LIBRARY_PATH} \"\${GCC_LIB_DIR}:\$ENV{LD_LIBRARY_PATH}\")
 endif()
 
@@ -306,6 +332,7 @@ add_custom_command(
           -DPROTOC_PATH=${Protobuf_PROTOC_EXECUTABLE}
           -DRUST_TARGET=${RUST_TARGET_TRIPLE}
           -DGCC_LIB_DIR=${GCC_LIB_DIR}
+          -DCROSS_COMPILE=${CMAKE_CROSSCOMPILING}
           -P "${RUN_CARGO_SCRIPT}"
   WORKING_DIRECTORY "${RUST_ROOT}"
   DEPENDS ${RUST_SOURCES}

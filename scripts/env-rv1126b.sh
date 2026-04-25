@@ -80,6 +80,18 @@ if [ -z "$LK_CUSTOM_WEBRTC" ] && [ -f "$HOME/webrtc-prebuilt/linux-arm64-release
   export LK_CUSTOM_WEBRTC="$HOME/webrtc-prebuilt/linux-arm64-release"
 fi
 
+# Rockchip MPP — Phase 6.1 hardware H.264 encoder. webrtc-sys/build.rs picks
+# these two up to compile + link librockchip_mpp into the webrtc-sys cdylib.
+# Without them the MPP encoder factory is excluded; OpenH264 keeps the slot.
+if [ -z "$ROCKCHIP_MPP_INCLUDE" ] && [ -f "$ATK_SDK_ROOT/external/mpp/inc/rk_mpi.h" ]; then
+  export ROCKCHIP_MPP_INCLUDE="$ATK_SDK_ROOT/external/mpp/inc"
+fi
+if [ -z "$ROCKCHIP_MPP_LIB" ] && [ -f "$ATK_SYSROOT/usr/lib/librockchip_mpp.so" ]; then
+  export ROCKCHIP_MPP_LIB="$ATK_SYSROOT/usr/lib"
+fi
+[ -n "$ROCKCHIP_MPP_INCLUDE" ] && echo "[env-rv1126b] ROCKCHIP_MPP_INCLUDE=$ROCKCHIP_MPP_INCLUDE"
+[ -n "$ROCKCHIP_MPP_LIB" ] && echo "[env-rv1126b] ROCKCHIP_MPP_LIB=$ROCKCHIP_MPP_LIB"
+
 echo "[env-rv1126b] ATK_SDK_ROOT=$ATK_SDK_ROOT"
 echo "[env-rv1126b] ATK_TOOLCHAIN_ROOT=$ATK_TOOLCHAIN_ROOT"
 echo "[env-rv1126b] ATK_SYSROOT=$ATK_SYSROOT"

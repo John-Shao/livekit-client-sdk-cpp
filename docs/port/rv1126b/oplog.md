@@ -715,5 +715,58 @@ webrtc-sys/src/video_encoder_factory.cpp — InternalFactory ctor 加 #if define
 
 预算 4-7 天累计实活时间，不含调试 NV12 stride / GOP / IDR 触发的玄学。
 
+#### [33.4] 6.1.4 落代码（init + encode loop bundle）
+
+骨架 stub 拆掉，`initMppContext()` 全部用 SDK 文档化的真 API 顺序做完：
+1. `mpp_buffer_group_get_internal(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)` —— 一个 DRM-backed 组
+2. `mpp_buffer_get(grp, &frm_buf, hor_stride*ver_stride*3/2)` —— NV12 输入 buffer
+3. `mpp_buffer_get(grp, &pkt_buf, frame_size)` —— 输出 packet buffer（同尺度上界）
+4. `mpp_create(&ctx, &mpi)` + `MPP_SET_OUTPUT_TIMEOUT=MPP_POLL_BLOCK(-1)` + `mpp_init(ENC, AVC)`
+5. `mpp_enc_cfg_init(&cfg)` + `MPP_ENC_GET_CFG` + 一组 `mpp_enc_cfg_set_s32`：
+   - `prep:width/height/hor_stride/ver_stride/format=MPP_FMT_YUV420SP`
+   - `rc:mode=CBR / bps_target / bps_max=17/16 / bps_min=15/16 / fps_in_num/denom / fps_out_num/denom / gop`
+   - `codec:type=AVC / h264:profile=66 / h264:level=31 / h264:cabac_en=0 / h264:qp_init=26 / h264:qp_min=10 / h264:qp_max=51`
+6. `MPP_ENC_SET_CFG` 落配 + `MPP_ENC_GET_HDR_SYNC` 拿 SPS+PPS 缓存到 `hdr_pps_sps_`
+
+`Encode()` 真活：I420Buffer→NV12 软转 → memcpy 进 frm_buf 的 mmap 指针（带 sync_begin/sync_end） → `mpp_frame_init` + 设 width/height/strides/MPP_FMT_YUV420SP/buffer → `mpp_meta_set_packet(KEY_OUTPUT_PACKET)` 预绑 pkt_buf → `encode_put_frame` → 阻塞 `encode_get_packet` → `mpp_packet_get_pos/get_length` 拿 NAL → IDR 检测（先 `KEY_OUTPUT_INTRA` meta 后 NAL 头解析） → IDR 帧前补 SPS/PPS（若 MPP 没自己塞） → `EncodedImage` + `CodecSpecificInfo{kVideoCodecH264, NonInterleaved, idr_frame}` → `OnEncodedImage()`。
+
+`SetRates()` 转发新 bps_target / fps 进 `MPP_ENC_SET_CFG`，承接 libwebrtc BWE 调速。
+
+#### [33.5] build.rs 链上去 + env 自动设
+
+build.rs 加 `cargo:rustc-link-lib=dylib=rockchip_mpp` —— 直链不延迟（板上 `/usr/lib/librockchip_mpp.so.0` 必在）。新加 `ROCKCHIP_MPP_LIB` env 给跨编 `-L` 路径（Buildroot sysroot `usr/lib`）。`scripts/env-rv1126b.sh` 探测 `$ATK_SDK_ROOT/external/mpp/inc/rk_mpi.h` + `$ATK_SYSROOT/usr/lib/librockchip_mpp.so` 自动 export，免手动设。
+
+#### [33.6] 编译路上踩两个坑
+
+1. **`struct MppApi` 前向声明对不上**：`rk_mpi.h` 里 `typedef struct MppApi_t { ... } MppApi;` —— struct tag 是 `MppApi_t` 不是 `MppApi`。我们 header 里 `struct MppApi;` 占位，链接器看着像同一个类型，编译器 deref 时炸"incomplete type"。**修法**：encoder.h 直接 `extern "C" { #include "rk_mpi.h" / mpp_buffer.h / mpp_frame.h / mpp_packet.h / rk_venc_cfg.h }`。include 路径靠 build.rs 加的 `ROCKCHIP_MPP_INCLUDE`，只在 USE_ROCKCHIP_MPP_VIDEO_CODEC 编译时加，不污染其他 .cpp。
+2. **`H264BitstreamParser::GetLastSliceQp(int*)` 旧 API**：当前 libwebrtc 里它是 `std::optional<int> GetLastSliceQp() const`，没参数版本。改 `if (auto qp_opt = h264_parser_.GetLastSliceQp()) { encoded.qp_ = *qp_opt; }`。
+3. **`rtc::scoped_refptr` 改名**：libwebrtc 把 `rtc::` 命名空间合进 `webrtc::`。改 `webrtc::scoped_refptr<webrtc::I420BufferInterface>`，跟仓内其它 webrtc-sys/*.cpp 一致。
+
+#### [33.7] readelf 验链 + 部署 v9
+
+```
+$ readelf -d build-rv1126b/lib/liblivekit_ffi.so | grep NEEDED
+ NEEDED librockchip_mpp.so.1                    ← 我们的新依赖
+ NEEDED libm.so.6 / libstdc++.so.6 / libgcc_s.so.1 / libc.so.6
+$ nm -D liblivekit_ffi.so | grep " U mpp_"
+ U mpp_buffer_get_with_tag
+ U mpp_create
+ U mpp_init                                     ← 都是 undef，运行时由 ld.so 解析
+$ ssh rv1126b-board ldd /opt/livekit/BoardLoopback | grep rockchip
+ librockchip_mpp.so.1 => /usr/lib/librockchip_mpp.so.1 (0x0000007f9a98a000)  ← 板上 OK
+```
+
+板上 `/usr/lib/librockchip_mpp.so.0` 2.4MB 通过 `librockchip_mpp.so.1` 软链命中。/dev/mpp_service + /dev/rga 都在。BoardLoopback v9 + 新 liblivekit*.so 已 scp 到 `/opt/livekit/`。
+
+**待用户**：拿一个未过期 token，`BOARD_LOOPBACK_USE_MPP=1 BOARD_LOOPBACK_VIDEO_CODEC=h264` 起一次端到端，看 `[mpp] InitEncode ... cached SPS+PPS NN bytes` + 手机端能否收到 H.264 流（stats 应显示 `implementation_name="RockchipMpp_H264"`）。
+
+#### [33.8] 风险点（供 smoke 时排查）
+
+- **MPP_ENC_GET_HDR_SYNC 可能返失败**：rv1126b 上 SPS/PPS 是否走 GET_HDR_SYNC 还要实测。我们的 fallback 是 NAL 头检测，IDR 时会自动跟随 MPP 自己产的 SPS/PPS（如果它产）。
+- **NV12 stride 对齐**：用了 16，rv1126b 编码器实际可能要 64（Y）/16（UV）。如果首帧 init 失败或编出来花屏，调成 `AlignUp(width, 64)`。
+- **CBR 收敛慢**：startBitrate 来自 libwebrtc，初始可能 200~400kbps，太低 MPP 会塞高 QP（51）出渣画质。可以观察前 1s qp_init 表现。
+- **block timeout 配 MPP_POLL_BLOCK**：encode_put_frame 必须先 set timeout 否则 encode_get_packet 立刻返 timeout。已设。
+
+
 
 参考 plan.md §Phase 6 (3 选 1：MPP 直接 / Rockit / GStreamer 插件) + facts.md §2.7 (b/g/h)。

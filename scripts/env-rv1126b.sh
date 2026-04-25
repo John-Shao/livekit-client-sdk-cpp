@@ -30,6 +30,16 @@ if [ -f "$HOME/.cargo/env" ]; then
   . "$HOME/.cargo/env"
 fi
 
+# Buildroot toolchain 不内建 ld.lld，而 client-sdk-rust/.cargo/config.toml
+# 强制 -fuse-ld=lld 来链 libwebrtc.a。把系统 /usr/bin/ld.lld 软链到 GCC 的
+# exec 搜索目录（host/aarch64-buildroot-linux-gnu/bin/），让 GCC 的 collect2
+# 能找到。Buildroot 重建 toolchain 后符号链接会丢，所以每次 source 幂等修一次。
+_atk_lld_dst="$ATK_TOOLCHAIN_ROOT/aarch64-buildroot-linux-gnu/bin/ld.lld"
+if [ -d "$(dirname "$_atk_lld_dst")" ] && [ ! -e "$_atk_lld_dst" ] && [ -x /usr/bin/ld.lld ]; then
+  ln -sf /usr/bin/ld.lld "$_atk_lld_dst"
+fi
+unset _atk_lld_dst
+
 PREFIX=aarch64-buildroot-linux-gnu
 TARGET=aarch64-unknown-linux-gnu
 

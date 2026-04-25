@@ -88,7 +88,15 @@ include(protobuf)
 # spdlog logging library (PRIVATE dependency).
 include(spdlog)
 # Ensure protoc executable is found.
-if(TARGET protobuf::protoc)
+# 交叉编译时 vendored protoc 是 target 架构的，host 跑不起来 —— 优先保留
+# protobuf.cmake 里已经填好的 host protoc（来自 -DProtobuf_PROTOC_EXECUTABLE
+# 或 find_program）。Native 优先用 vendored target，因为它和 vendored 运行时
+# 同源一致。
+if(CMAKE_CROSSCOMPILING)
+  if(NOT Protobuf_PROTOC_EXECUTABLE OR Protobuf_PROTOC_EXECUTABLE MATCHES "TARGET_FILE")
+    find_program(Protobuf_PROTOC_EXECUTABLE NAMES protoc REQUIRED)
+  endif()
+elseif(TARGET protobuf::protoc)
   set(Protobuf_PROTOC_EXECUTABLE "$<TARGET_FILE:protobuf::protoc>")
 elseif(NOT Protobuf_PROTOC_EXECUTABLE)
   find_program(Protobuf_PROTOC_EXECUTABLE NAMES protoc REQUIRED)
@@ -237,7 +245,17 @@ if(DEFINED RUST_TARGET AND NOT RUST_TARGET STREQUAL \"\")
 endif()
 
 message(STATUS \"[run_cargo.cmake] CFG=\${CFG}  CARGO=\${CARGO}  PROTOC=\${PROTOC_PATH}\")
-set(ENV{PROTOC} \"\${PROTOC_PATH}\")
+# 交叉编译时 PROTOC_PATH 指向 vendored protobuf 编出来的目标架构 protoc（aarch64），
+# 在 host 跑不起来。让 cargo 用调用方 env 里的 host PROTOC（env-rv1126b.sh 导出了
+# \$(command -v protoc)）。Native 路径继续走 PROTOC_PATH。
+if(DEFINED CROSS_COMPILE AND CROSS_COMPILE)
+  if(NOT DEFINED ENV{PROTOC} OR \"\$ENV{PROTOC}\" STREQUAL \"\")
+    message(FATAL_ERROR \"[run_cargo.cmake] Cross build requires host PROTOC in env; source scripts/env-rv1126b.sh first\")
+  endif()
+  message(STATUS \"[run_cargo.cmake] Cross build — keeping env PROTOC=\$ENV{PROTOC}\")
+else()
+  set(ENV{PROTOC} \"\${PROTOC_PATH}\")
+endif()
 
 if(DEFINED GCC_LIB_DIR AND NOT GCC_LIB_DIR STREQUAL \"\")
   # 交叉编译时不要往 RUSTFLAGS 注 -L —— 上游 client-sdk-rust/.cargo/config.toml

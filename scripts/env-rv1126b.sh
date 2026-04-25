@@ -22,12 +22,20 @@ if [ ! -x "$ATK_TOOLCHAIN_ROOT/usr/bin/aarch64-buildroot-linux-gnu-gcc" ]; then
   return 1 2>/dev/null || exit 1
 fi
 
-# PATH 前置工具链 bin
-export PATH="$ATK_TOOLCHAIN_ROOT/usr/bin:$PATH"
+# PATH 后置工具链 bin —— 让 system cmake/make/python3 等无前缀工具仍走系统版（Buildroot
+# host/usr/bin 自带 cmake 但没编 HTTPS-libcurl，FetchContent 直接挂）；带前缀的
+# aarch64-buildroot-linux-gnu-* 在系统里没有，照样从 toolchain 命中。
+export PATH="$PATH:$ATK_TOOLCHAIN_ROOT/usr/bin"
 
 # 确保 rustup 的 cargo/rustc 在 PATH（非交互 ssh 不会自动 source ~/.cargo/env）
 if [ -f "$HOME/.cargo/env" ]; then
   . "$HOME/.cargo/env"
+fi
+
+# pip --user 安装的可执行（如新版 cmake）放在这里 —— focal 系统 cmake 是 3.16.3，
+# 项目 CMakeLists.txt 要求 ≥ 3.20，pip install --user cmake 拿 4.x 救场。
+if [ -d "$HOME/.local/bin" ]; then
+  export PATH="$HOME/.local/bin:$PATH"
 fi
 
 # Buildroot toolchain 不内建 ld.lld，而 client-sdk-rust/.cargo/config.toml

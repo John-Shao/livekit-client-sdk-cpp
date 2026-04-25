@@ -679,4 +679,41 @@ Phase 5 用软编（libwebrtc 内置 VP8 + Opus），A53 × 4 在 320×240 ~ 720
 4. **数据通道**（已知 polish）：jusiai NAT/防火墙下 SCTP-DTLS 协商超时，BoardLoopback 已移除 data publish；需调 server STUN/TURN
 5. **延迟优化**：当前端到端约 1-1.5 秒（ALSA 1s + RTP/SRTP jitter）。MPP 编解码延迟可比软编低，可缩到 ~500ms
 
+### [33] Phase 6.1 SKELETON：MPP encoder hooks（编不动，但路由通了）
+
+子模 `client-sdk-rust` 拉本地分支 `port/rv1126b-mpp`（基线 `fd3df87`），落 4 个新文件 + 改 2 个现有文件：
+
+```
+webrtc-sys/src/rockchip_mpp/
+├── rockchip_mpp_encoder.h           — RockchipMppH264EncoderImpl : webrtc::VideoEncoder 声明
+├── rockchip_mpp_encoder.cpp         — Encode() 返回 WEBRTC_VIDEO_CODEC_ERROR，initMppContext() 返回 -1 故意失败
+├── rockchip_mpp_encoder_factory.h   — RockchipMppVideoEncoderFactory : webrtc::VideoEncoderFactory 声明
+└── rockchip_mpp_encoder_factory.cpp — IsSupported() 双闸：getenv("BOARD_LOOPBACK_USE_MPP")=="1" && stat("/dev/mpp_service")
+webrtc-sys/build.rs                  — arm/Linux 块加 ROCKCHIP_MPP_INCLUDE 处理 + cargo:rerun-if-env-changed
+webrtc-sys/src/video_encoder_factory.cpp — InternalFactory ctor 加 #if defined(USE_ROCKCHIP_MPP_VIDEO_CODEC) 注册块
+```
+
+#### [33.1] 设计意图：可建构 + 默认不选
+
+- **可建构**：`ROCKCHIP_MPP_INCLUDE=$HOME/atk-dlrv1126b-sdk/external/mpp/inc` cargo 编通，`BoardLoopback` 链接成功，端到端 v8 落板
+- **默认不选**：`IsSupported()` 默认 `false` —— 板上跑没设 `BOARD_LOOPBACK_USE_MPP=1` 时 OpenH264 仍占 H.264 slot
+- **opt-in 也安全**：即便设了环境变量，`Encode()` 返 `ERROR`、`initMppContext()` 返 -1，会立刻 `WEBRTC_VIDEO_CODEC_ERROR` 把控制权让回去；fallback 留给 `Factory`（OpenH264 优先）
+
+板上 25s baseline 跑（不设 env）：codec=H264，V4L2/ALSA/DRM 全路径稳，无回归。骨架的存在不破坏 Phase 5 已绿的路径。
+
+#### [33.2] 子模分叉策略
+
+`client-sdk-rust` 上游 pin 在 `fd3df87`（livekit/main 上游 `TEL-464`），我们的 MPP 改动落 **本地分支** `port/rv1126b-mpp` `9419bfc`，**没推 origin**（origin 是上游 livekit/client-sdk-rust 只读）。
+
+后续 fork 时机：6.1.4 真 MPP API 接通、回归通过、再 fork `John-Shao/client-sdk-rust` 推上去；父仓 `.gitmodules` 同步切到 fork URL。在那之前，子模处于 "本地领先 1 个 commit、上游不可推" 状态，clone 父仓后需先 `git submodule update --init` 再 `git -C client-sdk-rust checkout port/rv1126b-mpp`。
+
+#### [33.3] 等 Phase 6.1.4
+
+`initMppContext()` 真活：`mpp_create` + `mpp_init(MPP_CTX_ENC, MPP_VIDEO_CodingAVC)` + `MppEncCfg`（size/fps/rc=cbr/bps_target/gop/profile）+ 两个 `mpp_buffer_group_get_internal(MPP_BUFFER_TYPE_DRM)` + `MPP_ENC_SET_CFG`。
+`Encode()` 真活：I420（或 RGA 零拷 NV12）→ `MppFrame` → `encode_put_frame` → 轮询 `encode_get_packet` → `EncodedImage` 喂 `encoded_callback_`。
+`SetRates()`：bitrate 变化 forward 到 MPP `MPP_ENC_SET_CFG` 的 `rc.bps_target`。
+
+预算 4-7 天累计实活时间，不含调试 NV12 stride / GOP / IDR 触发的玄学。
+
+
 参考 plan.md §Phase 6 (3 选 1：MPP 直接 / Rockit / GStreamer 插件) + facts.md §2.7 (b/g/h)。

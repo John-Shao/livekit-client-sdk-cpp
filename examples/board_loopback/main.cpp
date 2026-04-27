@@ -32,6 +32,7 @@
 #include "livekit/video_frame.h"
 #include "livekit/video_source.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -73,8 +74,24 @@
 
 using namespace livekit;
 
-constexpr int kWidth = 320;
-constexpr int kHeight = 240;
+// Video resolution presets — selected via BOARD_LOOPBACK_VIDEO_RES env
+// (sd / hd / fhd, default hd). Each triplet drives V4L2 capture, framerate
+// hint via S_PARM, and the publish-side max_bitrate so simulcast / BWE
+// don't starve high-resolution layers (default WebRTC bitrate allocator
+// gives 720p only ~30 kbps without an explicit cap, producing block-heavy
+// garbage on the wire).
+struct VideoResolution {
+  int width;
+  int height;
+  int fps;
+  std::uint64_t max_bitrate_bps; // sane WebRTC defaults per resolution tier
+  const char *name;
+};
+constexpr VideoResolution kResSD  = { 640,  480, 30, 1'000'000, "SD"  };
+constexpr VideoResolution kResHD  = {1280,  720, 30, 2'500'000, "HD"  };
+constexpr VideoResolution kResFHD = {1920, 1080, 25, 4'000'000, "FHD" };
+
+constexpr VideoResolution kDefaultRes = kResHD;
 constexpr const char *kVideoTrackName = "board-cam";
 constexpr const char *kAudioTrackName = "board-mic";
 constexpr int kAudioSampleRate = 48000;
@@ -283,7 +300,7 @@ static AlsaPlayer g_alsa;
 // ---------------------------------------------------------------
 class V4l2Capture {
 public:
-  bool open(const char *device, int width, int height) {
+  bool open(const char *device, int width, int height, int fps = 30) {
     fd_ = ::open(device, O_RDWR | O_CLOEXEC);
     if (fd_ < 0) {
       std::cerr << "[loopback] v4l2 open(" << device
@@ -292,6 +309,7 @@ public:
     }
     width_ = width;
     height_ = height;
+    fps_ = fps;
 
     v4l2_capability cap{};
     if (ioctl(fd_, VIDIOC_QUERYCAP, &cap) < 0) {
@@ -322,10 +340,29 @@ public:
     width_ = fmt.fmt.pix_mp.width;
     height_ = fmt.fmt.pix_mp.height;
     plane_size_ = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+
+    // Negotiate framerate via S_PARM. The driver may quantize to whatever
+    // the sensor + rkisp pipeline supports — we read back actual fps to
+    // log the truth. Older drivers return EINVAL on S_PARM for capture;
+    // treat as soft warning, fall back to whatever default the driver picks.
+    v4l2_streamparm parm{};
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = static_cast<__u32>(fps);
+    if (ioctl(fd_, VIDIOC_S_PARM, &parm) < 0) {
+      std::cerr << "[loopback] v4l2 S_PARM(fps=" << fps << ") not supported: "
+                << std::strerror(errno) << " (using driver default)\n";
+    } else if (parm.parm.capture.timeperframe.denominator) {
+      fps_ = static_cast<int>(parm.parm.capture.timeperframe.denominator /
+                              std::max<__u32>(parm.parm.capture.timeperframe.numerator, 1));
+    }
+
     std::cout << "[loopback] v4l2 negotiated: " << width_ << "x" << height_
-              << " NV12 plane_size=" << plane_size_ << "\n";
+              << "@" << fps_ << "fps NV12 plane_size=" << plane_size_ << "\n";
     return true;
   }
+
+  int fps() const { return fps_; }
 
   bool startStream(int buf_count = 4) {
     v4l2_requestbuffers reqbuf{};
@@ -457,6 +494,7 @@ private:
   int fd_ = -1;
   int width_ = 0;
   int height_ = 0;
+  int fps_ = 30;
   std::uint32_t plane_size_ = 0;
   std::vector<Buf> buffers_;
 };
@@ -895,14 +933,36 @@ int main(int argc, char *argv[]) {
   // or BOARD_LOOPBACK_SYNTH_VIDEO=1 is set.
   const bool synth_video =
       std::getenv("BOARD_LOOPBACK_SYNTH_VIDEO") != nullptr;
+  // Resolution preset selection: BOARD_LOOPBACK_VIDEO_RES = sd | hd | fhd
+  VideoResolution selected_res = kDefaultRes;
+  if (const char *res_env = std::getenv("BOARD_LOOPBACK_VIDEO_RES")) {
+    std::string s(res_env);
+    for (auto &c : s) c = static_cast<char>(std::tolower(c));
+    if      (s == "sd")  selected_res = kResSD;
+    else if (s == "hd")  selected_res = kResHD;
+    else if (s == "fhd") selected_res = kResFHD;
+    else std::cerr << "[loopback] unknown BOARD_LOOPBACK_VIDEO_RES='"
+                   << res_env << "', using default " << kDefaultRes.name
+                   << "\n";
+  }
+  std::cout << "[loopback] requested resolution: " << selected_res.name
+            << " (" << selected_res.width << "x" << selected_res.height
+            << "@" << selected_res.fps << "fps)\n";
+  // Note: rotation is consumed by the MPP encoder via env, not by the
+  // VideoSource::captureFrame rotation parameter. RTP rotation extension
+  // didn't actually take effect with the current receiver; the encoder
+  // pre-rotates the bitstream and ships it upright on the wire instead.
+
   std::unique_ptr<V4l2Capture> v4l2;
-  int video_w = kWidth, video_h = kHeight;
+  int video_w = selected_res.width, video_h = selected_res.height;
   if (!synth_video) {
     const char *v4l2_dev_env = std::getenv("V4L2_DEVICE");
     const char *v4l2_dev =
         (v4l2_dev_env && *v4l2_dev_env) ? v4l2_dev_env : "/dev/video-camera0";
     v4l2 = std::make_unique<V4l2Capture>();
-    if (v4l2->open(v4l2_dev, kWidth, kHeight) && v4l2->startStream()) {
+    if (v4l2->open(v4l2_dev, selected_res.width, selected_res.height,
+                   selected_res.fps) &&
+        v4l2->startStream()) {
       video_w = v4l2->width();
       video_h = v4l2->height();
     } else {
@@ -933,6 +993,16 @@ int main(int argc, char *argv[]) {
   TrackPublishOptions vopts_pub;
   vopts_pub.source = TrackSource::SOURCE_CAMERA;
   vopts_pub.video_codec = vc;
+  // Single-publisher single-resolution setup: disable simulcast (no need
+  // to triple-encode for diverse subscribers) and pin max_bitrate so the
+  // top layer actually gets the bandwidth it needs. Without this, BWE's
+  // default 3-layer split gives 720p only ~30 kbps and the picture is a
+  // block-heavy mush.
+  vopts_pub.simulcast = false;
+  VideoEncodingOptions venc;
+  venc.max_bitrate = selected_res.max_bitrate_bps;
+  venc.max_framerate = static_cast<double>(selected_res.fps);
+  vopts_pub.video_encoding = venc;
   lp->publishTrack(video_track, vopts_pub);
   std::cout << "[loopback] publishing video '" << kVideoTrackName << "' "
             << video_w << "x" << video_h << " codec=" << vc_name << " ("

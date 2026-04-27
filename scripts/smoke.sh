@@ -11,7 +11,14 @@
 # 任一缺失则后退到下一项；都没有则报错退出。
 #
 # 用法:
-#   ./smoke.sh                    MPP H.264 双向硬件 (默认)
+#   ./smoke.sh                    MPP H.264 双向硬件, HD 720P30 (默认)
+#   ./smoke.sh --res sd           切 480P30   (640x480 @ 30fps)
+#   ./smoke.sh --res hd           切 720P30   (1280x720 @ 30fps，默认)
+#   ./smoke.sh --res fhd          切 1080P25  (1920x1080 @ 25fps)
+#   ./smoke.sh --rotate 0         关掉默认 +90° 补偿（其他硬件 / sensor 装正了的板）
+#   ./smoke.sh --rotate 90        默认。补偿 ATK-DLRV1126B 摄像头 +90° sensor 偏角
+#   ./smoke.sh --rotate 180       180° 翻转（如果板子装反了）
+#   ./smoke.sh --rotate 270       逆时针 90°
 #   ./smoke.sh --no-mpp           关 MPP，走 OpenH264/libvpx 软 codec
 #   ./smoke.sh --codec vp8        切 publish codec (h264/vp8/vp9/h265)
 #   ./smoke.sh --token <JWT>      显式传 token
@@ -19,7 +26,7 @@
 #   ./smoke.sh --tail             追看最近一次后台跑的日志
 #
 # Ctrl-C 退出前台模式。
-# 例: BOARD_LOOPBACK_MIC_GAIN=4 ./smoke.sh
+# 例: BOARD_LOOPBACK_MIC_GAIN=4 ./smoke.sh --res fhd
 set -e
 
 # ---- 默认值 ----
@@ -27,6 +34,10 @@ URL="${LIVEKIT_URL:-wss://live.jusiai.com}"
 TOKEN_FILE="/opt/livekit/.token"
 USE_MPP=1
 CODEC=h264
+RES=hd
+# ATK-DLRV1126B 摄像头 sensor 物理装 +90° 偏角，编码前要旋转 90° 才能让对端看到
+# 直立画面。其他硬件可能不需要补偿，传 --rotate 0 关闭。
+ROTATE=90
 TOKEN=""
 BG=0
 LOG=/tmp/smoke.log
@@ -37,6 +48,8 @@ while [ $# -gt 0 ]; do
     --no-mpp)   USE_MPP=0 ;;
     --mpp)      USE_MPP=1 ;;
     --codec)    CODEC="$2"; shift ;;
+    --res)      RES="$2"; shift ;;
+    --rotate)   ROTATE="$2"; shift ;;
     --token)    TOKEN="$2"; shift ;;
     --url)      URL="$2"; shift ;;
     --bg)       BG=1 ;;
@@ -90,6 +103,8 @@ export LD_LIBRARY_PATH=/opt/livekit:/usr/lib
 export LIVEKIT_URL="$URL"
 export LIVEKIT_TOKEN="$TOKEN"
 export BOARD_LOOPBACK_VIDEO_CODEC="$CODEC"
+export BOARD_LOOPBACK_VIDEO_RES="$RES"
+export BOARD_LOOPBACK_VIDEO_ROTATE="$ROTATE"
 if [ "$USE_MPP" = "1" ]; then
   export BOARD_LOOPBACK_USE_MPP=1
 else
@@ -100,6 +115,8 @@ fi
 echo "==== smoke ===="
 echo "  url      = $URL"
 echo "  codec    = $CODEC"
+echo "  res      = $RES (sd=480P30 / hd=720P30 / fhd=1080P25)"
+echo "  rotate   = $ROTATE (deg, MPP hardware rotation)"
 echo "  use_mpp  = $USE_MPP"
 echo "  bg       = $BG"
 echo "  log      = $LOG (only when --bg)"

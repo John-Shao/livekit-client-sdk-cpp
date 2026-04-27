@@ -987,9 +987,14 @@ int main(int argc, char *argv[]) {
             << (capture_pcm ? "live mic" : "synth 440Hz sine") << "\n";
 
   // ES8389 mic 默认增益偏低，先用纯软件 gain 提一下。BOARD_LOOPBACK_MIC_GAIN
-  // 可改（推荐 4-12，>16 容易削顶）。1.0 关闭软件放大走原始电平。
-  // 默认 12× —— 在 ATK-DLRV1126B 板载 mic 上实测人声清晰可辨。
-  float mic_gain = 12.0f;
+  // 可改。1.0 关闭软件放大走原始电平。
+  //
+  // 历史：早先默认 12× 是因为 SDK 内部的 AGC 又把信号压回去（webrtc PCF 默认
+  // 装 BuiltinAudioProcessingBuilder 开启 AGC1 + AGC2），所以表面上 12× 实际
+  // 远端听到的还是软。webrtc-sys/peer_connection_factory.cpp 里关掉 AGC 后，
+  // 12× 会真的 12×，几乎肯定 clip 失真。8× 是安全 headroom；如果板上 mic 装
+  // 配后噪音底大或离嘴远，env 调到 10-12；如果离嘴近，env 调到 4-6 避失真。
+  float mic_gain = 8.0f;
   if (const char *g_env = std::getenv("BOARD_LOOPBACK_MIC_GAIN")) {
     try {
       mic_gain = std::stof(g_env);

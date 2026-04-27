@@ -1029,6 +1029,53 @@ v26 (Step B):
 
 下一步候选：真正的 dmabuf 零拷（MPP decode → DRM scan-out 直通 dmabuf，再省一次 memcpy）。但需要改 SDK FFI（让 NV12 buffer 不进 boxed_slice 而透传指针 + 生命周期），是个大动作。当前 23-29% 单核已经好得不要不要的，可暂缓。
 
+### [37] 远端音量过小 ("听筒感") —— 双层修复
+
+#### [37.1] 现象
+板子→手机方向，无论软编 / MPP 都听感像从手机听筒里出来（实际开了扬声器）。之前的 12× 软件增益治标不治本。
+
+#### [37.2] 根因 1：WebRTC PCF 默认 AGC 把信号又压回去
+
+`client-sdk-rust/webrtc-sys/src/peer_connection_factory.cpp` 装的 `BuiltinAudioProcessingBuilder`，**默认 config 开启 AGC1 + AGC2**。机制：
+
+1. ALSA mic 捕到的信号本就低
+2. 我们 12× 软件放大到接近 clip
+3. 信号进 webrtc 的 APM
+4. AGC 看到 hot/clipping signal，**自动把它压下去** —— 这是 AGC 该干的事
+5. Opus 编出来的电平回到 "normal voice"，软件放大被 SDK 自己抵消
+6. 手机端听到的就跟"听筒"一样
+
+修：传 `AudioProcessing::Config{ec=false, agc1=false, agc2=false, hp=false, ns=false}` 进 builder。板上没有 acoustic loopback 要 cancel，也不需要 NS/HPF（本就该原始信号）。提交 `af40b9c`。
+
+#### [37.3] 根因 2：ES8389 mic 的硬件 PGA 关在最小档
+
+`amixer -c 0 contents` 列出来：
+
+```
+numid=39 'ADCL PGA Volume'  range 0-14, step 3.00 dB, default 0
+numid=40 'ADCR PGA Volume'  range 0-14, step 3.00 dB, default 0
+```
+
+**PGA = 0 dB**（mic 模拟前置增益完全关闭）。这是硬件层把信号在进 ADC 之前就砍了，软件再怎么 ×N 也救不动 dynamic range。
+
+调试过程（每次 +3 dB）：
+- PGA=14 (+42 dB)：人没说话就音爆，远端环境噪声放大到爆
+- PGA=6 (+18 dB)：明显改善，但偏小
+- PGA=7 (+21 dB)：再大点
+- PGA=8 (+24 dB)：再大点
+- **PGA=9 (+27 dB)**：✅ 用户判定"声音够大"。固化。
+
+总链路：mic → ES8389 PGA **+27 dB** → ADC → ALSA → 软件 **8×（+18 dB）** → AudioTrackSource → APM (passthrough) → Opus → SFU → 手机。等效 ~+45 dB，比之前纯 12× 软件 +21 dB 强 24 dB（≈ 16×）。
+
+#### [37.4] 持久化 + 自动应用
+
+- `alsactl store` 写 `/var/lib/alsa/asound.state`，重启后由 init 自动恢复
+- `/opt/livekit/smoke.sh` 启动时调 `amixer cset` 兜底
+- `scripts/board-audio-setup.sh` 一次性配置脚本，PGA 值可 env 调，给新板初始化用
+
+`examples/board_loopback/main.cpp` 默认 `mic_gain` 12 → **8**，因为去掉 AGC 后 12× 几乎一定 clip。env `BOARD_LOOPBACK_MIC_GAIN` 可调（推荐 4-12 范围）。
+
+
 
 
 

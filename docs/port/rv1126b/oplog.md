@@ -981,6 +981,55 @@ v18 实测：30 fps 解码持平，simulcast 切换正常，退出**干净落到
 
 **Phase 6.1.5 Step A 完成**。Step B（真 RGA 硬件路径，imcvtcolor 完全替代 NEON）收益估计 1-2% 单核，性价比低；真正下一阶段大头是 **dmabuf 零拷**（MPP 解码输出直接 scan-out 到 DRM，不经 SDK FFI 的 I420 中转），估计 ~10% 单核，但要改 SDK FFI / 加 raw video hook，工时 1-2 天。
 
+### [36] Phase 6.1.5 Step B：NV12 全链路无格式转换（v26, commit `d7da5c9`）
+
+不走 RGA 硬件，走**取消转换**：让 NV12 buffer 从 MPP 解码器一直透传到 DRM plane，中间一次格式转换都不做。比 Step A 的 NEON 加速更彻底（NEON 还是要 CPU 做 memcpy/interleave，"取消转换"则连 memcpy 都省掉）。
+
+#### [36.1] 流程对比
+
+```
+v19 (Step A):
+  MPP NV12 → libyuv NV12→I420 (我们解码器内) → SDK FFI 透传 I420
+  → BoardLoopback 收到 I420 → NEON I420→NV12 → DRM NV12 plane
+
+v26 (Step B):
+  MPP NV12 → memcpy strip-stride 进 NV12Buffer → SDK FFI nv12_copy 透传 NV12
+  → BoardLoopback 收到 NV12 → 直接喂 DRM NV12 plane
+```
+
+每帧 720p 节省 ~4 MB 内存带宽（一次 NV12→I420 + 一次 I420→NV12，每次 ~1.5×720×1280 = 1.4 MB 输入侧 + 同量输出侧）。30fps 累计 ~120 MB/s。
+
+#### [36.2] 上游 SDK FFI 三个 bug 顺手修
+
+之前 BoardLoopback `vopts.format = NV12` 报"convert to Nv12 not supported"是因为我们解码器返 I420 → FFI cvt_i420 不支持→NV12。现在我们返 NV12，触发 `cvt_nv12` → `nv12_copy` 路径，然后炸出三个 bug：
+
+1. **`webrtc-sys/src/video_frame_buffer.rs` cxx-bridge 枚举漏 kI210/kI410**（位置 6/7）。webrtc::VideoFrameBuffer::Type::kNV12 = 8，C++ 端 `static_cast` 保留这个整数，Rust 端只有 7 个变体 → 命中 `_ => unreachable!()`。修：枚举对齐 webrtc 9 个变体。
+
+2. **`livekit-ffi/.../cvtimpl.rs cvt_nv12` 的 dst stride 传 `chroma_w`** 是 chroma 列数（360 for 720w），但 imgproc 期望字节 stride。NV12 biplanar 字节 stride = `chroma_w * 2 = 720`。触发 assert `src_stride_uv >= width + width%2` 失败。修：传 `chroma_w * 2`。
+
+3. **`livekit-ffi/.../mod.rs nv12_info` 的 UV size 公式** `stride_uv * chroma_height * 2`，原假设 stride_uv 是 chroma 列数所以 ×2 拿字节。我们改成字节后这个 ×2 重复了一次，UV size 报告翻倍。下游消费者按 size 读取走出 buffer 边界 → segfault。修：去掉 `* 2`。
+
+#### [36.3] 解码器 `mpp_buffer_group_clear` 又被加回去了
+
+[34.9] / `0d2c8fd` 把 info_change 时的 `mpp_buffer_group_clear` 删了，因为推断它跟 MPP worker 抢 ref count 导致退出 segfault。后来发现退出 segfault 真正原因是 `mpp_destroy` 前没解绑 buffer group（已修），与 clear 无关。
+
+去掉 clear 之后 simulcast layer 升级时 MPP slot table 里残留旧 buffer 不放，新更大尺寸 buffer 没法分配 → 第二帧之后冻结 / segfault。Step B smoke 反复重现这个症状 → 把 clear 加回来 + 维持 [34.9] 的 detach + reset 退出顺序。两全。
+
+另加 `mpp_buffer_get_size` 防御检查：如果 MPP 这一帧的 buffer < `hor_stride*ver_stride*1.5`（simulcast 升级 race），跳这一帧不读越界。
+
+#### [36.4] v26 实测（手机端 H.264 publish + 板上 BoardLoopback 持续 100s+）
+
+- BoardLoopback 单核 CPU **23 ~ 29%**（vs v19 38.9%）—— **省 ~12 个百分点单核** ≈ 25-30% 相对降低
+- published 31fps 稳，remote video 30fps 跟得上（4161 帧 / 138s ≈ 30 fps）
+- 0 audio underrun，0 dropped
+- 画面延迟 <400ms 不增长
+- 简易 simulcast 切换正常
+
+**Phase 6.1.5 Step B 完成**。从 Phase 6.2 终版（~46-50% 推测）到 v26 的 23-29%，**整个 Phase 6.1.5 累计节省 ~50% 相对 CPU**。
+
+下一步候选：真正的 dmabuf 零拷（MPP decode → DRM scan-out 直通 dmabuf，再省一次 memcpy）。但需要改 SDK FFI（让 NV12 buffer 不进 boxed_slice 而透传指针 + 生命周期），是个大动作。当前 23-29% 单核已经好得不要不要的，可暂缓。
+
+
 
 
 

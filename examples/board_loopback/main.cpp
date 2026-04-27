@@ -784,52 +784,27 @@ public:
 
     auto stats = g_stats.get(identity, track_name);
     if (kind == TrackKind::KIND_VIDEO) {
-      // 让 SDK 产出 I420（最稳定的 YUV 格式，FFI convert pipeline 不支持
-      // NV12 作为目标）。我们在 callback 里 I420→NV12（trivial 软转换）
-      // 然后送 DRM。
+      // Phase 6.1.5 step B: 全链路 NV12 不再来回转 I420。
+      // - 我们 MPP 解码器输出 NV12Buffer
+      // - SDK FFI 的 cvt_nv12 路径（livekit-ffi/server/colorcvt）NV12→NV12
+      //   走单次 nv12_copy memcpy
+      // - 这里收到 NV12 直接喂 DRM plane（DRM_FORMAT_NV12），中间零格式转换
+      // 之前 I420 路径每帧 720p 多吃 ~4 MB 内存带宽（解码侧 NV12→I420 +
+      // 显示侧 I420→NV12），30fps 累计 ~120 MB/s，省下来 CPU 留给别的。
       VideoStream::Options vopts;
-      vopts.format = VideoBufferType::I420;
+      vopts.format = VideoBufferType::NV12;
       vopts.capacity = 8; // ring buffer 防止积压
       room.setOnVideoFrameCallback(
           identity, track_name,
           [stats](const VideoFrame &frame, std::int64_t /*ts*/) {
             stats->video_frames.fetch_add(1, std::memory_order_relaxed);
             if (!g_drm_ok.load(std::memory_order_relaxed) ||
-                frame.type() != VideoBufferType::I420)
+                frame.type() != VideoBufferType::NV12)
               return;
-            // I420 → NV12 软转换：Y 平面 memcpy（libc 已 NEON 化），
-            // UV 用 NEON `vst2q_u8` 一次写 32 字节交错（vs 之前每次 2 字节
-            // 的标量循环，720p 下省 ~10x CPU）。
-            const int w = frame.width();
-            const int h = frame.height();
-            const std::size_t y_size = static_cast<std::size_t>(w) * h;
-            const std::size_t uv_each =
-                static_cast<std::size_t>(w / 2) * (h / 2);
-            const std::uint8_t *src = frame.data();
-            const std::uint8_t *u = src + y_size;
-            const std::uint8_t *v = u + uv_each;
-            // 用 thread-local 缓冲避免每帧 alloc
-            thread_local std::vector<std::uint8_t> nv12_buf;
-            nv12_buf.resize(y_size + uv_each * 2);
-            std::memcpy(nv12_buf.data(), src, y_size);
-            std::uint8_t *uv = nv12_buf.data() + y_size;
-            std::size_t i = 0;
-#if BOARD_LOOPBACK_HAVE_NEON
-            // NEON: load 16 bytes from u + 16 from v, interleave as u0 v0 u1
-            // v1 ... u15 v15, store 32 bytes. Each iteration handles 16 UV
-            // pairs.
-            for (; i + 16 <= uv_each; i += 16) {
-              uint8x16_t u_vec = vld1q_u8(u + i);
-              uint8x16_t v_vec = vld1q_u8(v + i);
-              uint8x16x2_t uv_pair = {{u_vec, v_vec}};
-              vst2q_u8(uv + 2 * i, uv_pair);
-            }
-#endif
-            for (; i < uv_each; ++i) {
-              uv[2 * i + 0] = u[i];
-              uv[2 * i + 1] = v[i];
-            }
-            g_drm.renderNV12(nv12_buf.data(), w, h);
+            // NV12 contiguous: data() = Y plane (w*h bytes), then UV plane
+            // (w*h/2 bytes interleaved). renderNV12 expects exactly this
+            // contiguous layout.
+            g_drm.renderNV12(frame.data(), frame.width(), frame.height());
           },
           vopts);
     } else if (kind == TrackKind::KIND_AUDIO) {

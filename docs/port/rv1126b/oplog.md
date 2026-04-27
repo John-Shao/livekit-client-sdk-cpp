@@ -962,6 +962,26 @@ v18 实测：30 fps 解码持平，simulcast 切换正常，退出**干净落到
 
 **Phase 6.2 真正画句号**。
 
+### [35] Phase 6.1.5 Step A：NEON 替换标量交错循环（v19, commit `862d727`）
+
+收尾性能优化。当前 30fps 已稳，但两处 I420↔NV12 软转换里**手写标量循环没用 NEON**：
+
+1. `examples/board_loopback/main.cpp` DRM 显示路径 I420 → NV12（每帧 ~230k 次 `uv[2i+0]=u[i]; uv[2i+1]=v[i]`）
+2. `client-sdk-rust/webrtc-sys/src/rockchip_mpp/rockchip_mpp_encoder.cpp` 的 `I420ToNV12` 同款 UV 交错
+
+修：
+
+- encoder.cpp：直接 `libyuv::I420ToNV12`，header 加 `third_party/libyuv/include/libyuv/convert_from.h`，函数体瘦 18 行→4 行
+- main.cpp：父仓没链 libyuv，手写 NEON intrinsics —— `vld1q_u8` × 2 (u/v)、构造 `uint8x16x2_t`、`vst2q_u8` 一次写 32 字节交错。配 `#if BOARD_LOOPBACK_HAVE_NEON` gate（`__aarch64__ || __ARM_NEON`），保留标量 fallback 处理尾部不足 16 字节的部分
+
+实测（v19，720p30 双向硬件 H.264）：
+- BoardLoopback 单核占用 **38.9%**（4 核系统约 10% 总占用）
+- 4 核负载均匀 8-10%，load avg 0.38 / 0.17 / 0.06
+- 退出后所有核 ~0%
+
+**Phase 6.1.5 Step A 完成**。Step B（真 RGA 硬件路径，imcvtcolor 完全替代 NEON）收益估计 1-2% 单核，性价比低；真正下一阶段大头是 **dmabuf 零拷**（MPP 解码输出直接 scan-out 到 DRM，不经 SDK FFI 的 I420 中转），估计 ~10% 单核，但要改 SDK FFI / 加 raw video hook，工时 1-2 天。
+
+
 
 
 

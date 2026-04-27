@@ -33,7 +33,13 @@
 #include "livekit/video_source.h"
 
 #include <cmath>
+#include <cstring>
 #include <vector>
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#define BOARD_LOOPBACK_HAVE_NEON 1
+#endif
 
 #include <alsa/asoundlib.h>
 
@@ -791,7 +797,9 @@ public:
             if (!g_drm_ok.load(std::memory_order_relaxed) ||
                 frame.type() != VideoBufferType::I420)
               return;
-            // I420 → NV12 软转换：Y 平面直拷，UV 按 U-V 配对插值
+            // I420 → NV12 软转换：Y 平面 memcpy（libc 已 NEON 化），
+            // UV 用 NEON `vst2q_u8` 一次写 32 字节交错（vs 之前每次 2 字节
+            // 的标量循环，720p 下省 ~10x CPU）。
             const int w = frame.width();
             const int h = frame.height();
             const std::size_t y_size = static_cast<std::size_t>(w) * h;
@@ -805,7 +813,19 @@ public:
             nv12_buf.resize(y_size + uv_each * 2);
             std::memcpy(nv12_buf.data(), src, y_size);
             std::uint8_t *uv = nv12_buf.data() + y_size;
-            for (std::size_t i = 0; i < uv_each; ++i) {
+            std::size_t i = 0;
+#if BOARD_LOOPBACK_HAVE_NEON
+            // NEON: load 16 bytes from u + 16 from v, interleave as u0 v0 u1
+            // v1 ... u15 v15, store 32 bytes. Each iteration handles 16 UV
+            // pairs.
+            for (; i + 16 <= uv_each; i += 16) {
+              uint8x16_t u_vec = vld1q_u8(u + i);
+              uint8x16_t v_vec = vld1q_u8(v + i);
+              uint8x16x2_t uv_pair = {{u_vec, v_vec}};
+              vst2q_u8(uv + 2 * i, uv_pair);
+            }
+#endif
+            for (; i < uv_each; ++i) {
               uv[2 * i + 0] = u[i];
               uv[2 * i + 1] = v[i];
             }

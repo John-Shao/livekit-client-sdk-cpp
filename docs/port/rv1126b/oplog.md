@@ -1075,6 +1075,26 @@ numid=40 'ADCR PGA Volume'  range 0-14, step 3.00 dB, default 0
 
 `examples/board_loopback/main.cpp` 默认 `mic_gain` 12 → **8**，因为去掉 AGC 后 12× 几乎一定 clip。env `BOARD_LOOPBACK_MIC_GAIN` 可调（推荐 4-12 范围）。
 
+#### [37.5] 反方向：板上扬声器太响
+
+PGA 修完之后跑通话，**反方向（手机→板子扬声器）声音偏大**，刺耳。
+
+`amixer -c 0 contents | grep -A4 DAC`：
+
+```
+numid=48 'DACL Playback Volume'  range 0-255, step 0.5 dB, base -95.5 dB, default 191 (0 dB)
+numid=49 'DACR Playback Volume'  same
+```
+
+DAC 默认 191 = 0 dB unity，扬声器原始信号直出。改 **171 = -10 dB**：用户判定"刚好"。`board-audio-setup.sh` 同步 + alsactl 持久化。
+
+完整 board-audio-setup.sh 现配置：
+- PGA = 9 (+27 dB mic 前级增益)
+- DAC = 171 (-10 dB 扬声器衰减)
+- 都通过 env 可覆盖（`PGA=8 DAC=161 ./board-audio-setup.sh`）
+
+**Phase 6 音频问题彻底收尾**。
+
 
 
 

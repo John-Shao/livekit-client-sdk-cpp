@@ -2,6 +2,10 @@
 CMakeFiles/
 CMakeCache.txt
 .DS_Store
+# LiveKit JWT credentials — board uses /opt/livekit/.token, never commit
+.token
+*.token
+.env
 Makefile
 cmake_install.cmake
 out

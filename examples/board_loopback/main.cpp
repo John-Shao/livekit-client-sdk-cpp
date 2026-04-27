@@ -87,9 +87,15 @@ struct VideoResolution {
   std::uint64_t max_bitrate_bps; // sane WebRTC defaults per resolution tier
   const char *name;
 };
-constexpr VideoResolution kResSD  = { 640,  480, 30, 1'000'000, "SD"  };
+// bits-per-pixel-per-frame at these caps:
+//   SD  640×480  @ 30fps × 1.5 Mbps = 0.163 bpp   (上手机 1080+ 屏放大不可避免有点糊)
+//   HD  1280×720 @ 30fps × 2.5 Mbps = 0.090 bpp   (实测最佳)
+//   FHD 1920×1080@ 25fps × 5.5 Mbps = 0.106 bpp   (略高于 HD 密度，补偿 1080p 细节)
+// H.264 Constrained Baseline 没有 CABAC / B-frames / 8x8 transform，
+// 比 Main 大约要多 20% 码率才能拿到同样画质。
+constexpr VideoResolution kResSD  = { 640,  480, 30, 1'500'000, "SD"  };
 constexpr VideoResolution kResHD  = {1280,  720, 30, 2'500'000, "HD"  };
-constexpr VideoResolution kResFHD = {1920, 1080, 25, 4'000'000, "FHD" };
+constexpr VideoResolution kResFHD = {1920, 1080, 25, 5'500'000, "FHD" };
 
 constexpr VideoResolution kDefaultRes = kResHD;
 constexpr const char *kVideoTrackName = "board-cam";

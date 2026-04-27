@@ -854,6 +854,39 @@ build 干净（30s 不到，只重编 6 个新 .o）。`liblivekit_ffi.so` 仍 D
 - **DRM 输出还要 I420 → NV12 再转回去**：板子收到我们 decode 出的 I420，BoardLoopback 的 DRM 路径再 I420→NV12 给 plane 用 —— 双向软转，2× CPU 浪费。RGA 零拷贝同时解决这个。
 - **buffer_pool 16 缓冲池**：与 24 个 MPP frame group 容量协同，720p×16 ≈ 6MB CPU 内存，可接受；若用 4K 输入需要调小。
 
+#### [34.5] 端到端验证：MPP 解码路径 active 实锤
+
+第一轮 v11/v12 多次 smoke：手机 publish 的是 **VP8/VP9** 不是 H.264 → 我们 factory 只 advertise H.264 → SDP 不匹配 → fallback 到 libvpx 软解。问题非 MPP，是 codec negotiation。诊断步骤：
+
+1. 加 stderr trace 在 `livekit_ffi::VideoDecoderFactory::Create` 看实际请求的 codec → `[ffi-dec] Create requested: VP8 / VP9`
+2. 用户手动改 LiveKit App 设置切到 H.264
+
+第二轮 v13 smoke 全过：
+```
+[ffi-dec] Create requested: H264 profile-level-id=42e01f          ← 手机改 H.264
+[mpp-dec] Create(H264 ...)                                          ← 我们 factory 选中
+[mpp-dec] Configure() — opening MPP context
+[mpp-dec] Configure OK                                              ← mpp_create + mpp_init(DEC, AVC) + grp + packet OK
+[mpp-dec] Decode() first packet size=8831 bytes                    ← 第一个 NAL 进 MPP
+[drm] dumb buffers ready: 2x 360x640 NV12                          ← 解出来的对端画面尺寸
+[loopback] remote streams: 8f3cf510-...: video=202 audio=3348      ← 30s 累计
+```
+
+双向硬件 codec 全开通：板 → 手机 906 帧/30s（MPP H.264 编） + 手机 → 板 video=202/30s（MPP H.264 解）。0 leak warning，0 crash。
+
+#### [34.6] 顺手扩 H.264 profile 覆盖
+
+`GetSupportedFormats` 从 `{ConstrainedBaseline, Baseline} × pkt-mode 1` 扩到 `{ConstrainedBaseline, Baseline, Main} × pkt-mode {0, 1}` —— 共 6 种 fmtp 组合。`SdpVideoFormat::IsSameCodec` 严格匹配 profile-level-id，不在 advertise 列表里的 profile 会悄悄 fallback 到软解。RV1126B VDPU 实际支持 Baseline/Main/High 全三个 profile（per Rockchip 文档），advertise 范围放宽不会带来额外硬件风险。
+
+#### [34.7] 已知盲区 / 未覆盖
+
+- **VP8 / VP9 仍走软解**：手机如果默认这俩 codec，CPU 仍吃 libvpx。后续若要真的"对所有 publisher 都硬件"，要扩 MPP factory 支持 VP8/VP9 解码（VDPU2 文档说支持）。Phase 6.4 候选。
+- **simulcast layer 选择**：手机推 simulcast 多层，我们订阅可能拿到不同 res。当前没有显式 prefer 高 layer，依赖 SFU 默认。
+- **手机端帧率间歇**：测试中后 5s `video=202` 数停滞，audio 仍长 —— 手机 video publish 暂停（切后台/锁屏/网络），不是我们解码出问题。
+
+**Phase 6 主线（编 + 解）画句号**。
+
+
 
 
 

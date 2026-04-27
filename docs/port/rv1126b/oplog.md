@@ -933,6 +933,36 @@ final  video=5628 audio=18777
 
 **Phase 6.2 达到生产可用水平**。剩下的 RGA 零拷（消除 NV12↔I420 双向软转）属于优化范围，对当前 30fps@720p 已经够用，可以暂缓。
 
+#### [34.9] 退出 segfault 收尾（v18, commit `0d2c8fd`）
+
+v17 性能完美但 Ctrl-C 后段错误。新 trace：
+```
+mpp_buffer: mpp_buffer_ref_dec buffer from try_proc_dec_task found non-positive ref_count 0 caller check_entry_unused
+mpp_buffer: mpp_buffer_ref_dec buffer from try_proc_dec_task found non-positive ref_count 0 caller mpp_frame_deinit
+Segmentation fault
+```
+
+`try_proc_dec_task` 是 MPP 内部 decoder worker 的 buffer 来源。问题在两处交互：
+
+1. **info_change 时 `mpp_buffer_group_clear` 与 worker 抢 ref count**：每次 simulcast 切换 limit 时，我们顺手 clear。但 worker 此刻可能正在用其中某个 buffer，clear 强制 dec ref → ref count 变 0 但 worker 还要再 deref 一次 → 失衡。修：去掉 info_change 时的 clear，只 limit_config，让 MPP 自己回收老 buffer。
+
+2. **teardown 时 `mpp_destroy` 内部还引用着我们 `MPP_DEC_SET_EXT_BUF_GROUP` 的 group**：destroy 调内部 cleanup → check_entry_unused 想 deref 已经被我们 group_put 释放的 buffer。修：destroy 前显式 `MPP_DEC_SET_EXT_BUF_GROUP=NULL` 解绑，再 `mpp_buffer_group_clear` 主动回收，最后才 destroy。
+
+新的 teardown 顺序：
+```cpp
+mpi->reset(ctx)
+→ mpi->control(MPP_DEC_SET_EXT_BUF_GROUP, NULL)   // detach group from ctx
+→ mpp_buffer_group_clear(grp)                      // proactive release
+→ mpp_packet_deinit(&packet)
+→ mpp_destroy(ctx)                                  // ctx no longer holds grp
+→ mpp_buffer_group_put(grp)
+```
+
+v18 实测：30 fps 解码持平，simulcast 切换正常，退出**干净落到 shell prompt 不再 segfault**。MPP 自带的 `mpp_buffer_service_deinit cleaning leaked buffer` 警告仍出现 —— 是 libmpp atexit 池跟踪器自家簿记 mismatch（user put 的 buffer 它认不出来），cosmetic，不触碰 freed 内存。
+
+**Phase 6.2 真正画句号**。
+
+
 
 
 

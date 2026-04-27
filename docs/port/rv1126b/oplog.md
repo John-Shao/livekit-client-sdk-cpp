@@ -886,6 +886,53 @@ build 干净（30s 不到，只重编 6 个新 .o）。`liblivekit_ffi.so` 仍 D
 
 **Phase 6 主线（编 + 解）画句号**。
 
+#### [34.8] 性能调优（v15→v17）：从 10fps 卡顿到 30fps 持平
+
+第一轮 v13/v14 端到端"通了"但**画面延迟从 1s 涨到 10s+**。3 个 bug 逐个揪出：
+
+##### Bug 1: simulcast 切换 buffer 不够 → 解码冻结
+v14 跑 15s 后 video 帧数停在 142 一直不动，audio 仍长。日志：
+```
+mpp[xxx]: mpp_buffer: mpp_buffer_create required size 471040 reach group size limit 122880
+```
+首次 info_change 时分了 122880 字节的 buffer group（够 180×320 用），手机后切到高 simulcast 层（720×480，需要 471040 字节），MPP 分不到 buffer，**解码彻底冻结**。修：每次 info_change 都重 `mpp_buffer_group_limit_config(grp, buf_size, 24)`。同时统一了 if/else 分支结构。提交 `5fb9a2f` 之类。
+
+##### Bug 2: drainOneFrame 浪费 100ms 等空 → 解码上限 10fps
+v15 不冻结了，但 video 解码稳定 10fps（源是 30fps），每秒落后 0.66s，30s 后 ~20s 延迟。
+
+定位：`Decode()` 内部 `for (i=0..8) drainOneFrame()` 拿到帧后**继续 drain，第二次 `decode_get_frame` 阻塞 100ms 超时**才返回。每帧白白等 100ms → 10fps。
+
+`drainOneFrame` 原 API 是 `bool`：true 表示"做了点什么继续 drain"。但**"传了一帧"**和**"info_change 已处理需再 drain"**没区分 → caller 误以为后面还有帧。
+
+修：API 改 enum `DrainResult{kNothing, kInfoChange, kFrame}`；`Decode()` 看到 kFrame 立即 break，看到 kInfoChange 才继续。提交 `97dcc14`。
+
+##### Bug 3: 退出时 segfault
+退出时：
+```
+mpp_buffer: mpp_buffer_service_deinit cleaning leaked group
+Segmentation fault
+```
+`mpp_destroy(ctx)` 后 libmpp 的 atexit 清理（mpp_buffer_service_deinit）尝试访问已经被我们 `mpp_buffer_group_put` 释放的 group，dangling pointer。修：`teardownMppContext` 开头先 `mpi->reset(ctx)` —— 同 mpi_dec_test.c 的清理顺序。同提交 `97dcc14`。
+
+##### v17 实测
+3 分钟稳跑：
+```
+T+5s   pub=151  remote video=152  audio=519
+T+30s  pub=905  remote video=906  audio=3032
+T+60s  pub=1808 remote video=1809 audio=6042
+T+90s  pub=2712 remote video=2713 audio=9055
+T+180s pub=5423 remote video=5423 audio=18092
+T+185s pub=5574 remote video=5573 audio=18595
+final  video=5628 audio=18777
+```
+- **30.1 fps decoded**（5573/185 = 30.13）
+- **published 与 remote 帧数差 ≤1**（永不积压）
+- **0 audio underrun，0 dropped**
+- **画面延迟 <400ms 且不增长**
+- 退出干净（待验 segfault 是否消失，v17 含修复）
+
+**Phase 6.2 达到生产可用水平**。剩下的 RGA 零拷（消除 NV12↔I420 双向软转）属于优化范围，对当前 30fps@720p 已经够用，可以暂缓。
+
 
 
 

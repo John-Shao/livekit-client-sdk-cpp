@@ -19,6 +19,9 @@
 #   ./smoke.sh --rotate 90        默认。补偿 ATK-DLRV1126B 摄像头 +90° sensor 偏角
 #   ./smoke.sh --rotate 180       180° 翻转（如果板子装反了）
 #   ./smoke.sh --rotate 270       逆时针 90°
+#   ./smoke.sh --fit fill         不拉伸，aspect-fill 裁切（默认；4:3 源在 9:16 屏取中竖条）
+#   ./smoke.sh --fit fit          aspect-fit letterbox 完整保留源 + 黑边
+#   ./smoke.sh --fit stretch      历史强拉满屏（A/B 对照用）
 #   ./smoke.sh --no-mpp           关 MPP，走 OpenH264/libvpx 软 codec
 #   ./smoke.sh --codec vp8        切 publish codec (h264/vp8/vp9/h265)
 #   ./smoke.sh                    AEC 默认开 (livekit::AudioProcessingModule AEC3+NS+HPF, 400ms delay)
@@ -38,6 +41,9 @@ TOKEN_FILE="/opt/livekit/.token"
 USE_MPP=1
 CODEC=h264
 RES=hd
+# 远端推过来的画面在屏幕上如何贴：fill 默认（裁中央竖条不留黑边）/ fit
+# letterbox（保留全部源，加黑边）/ stretch 历史拉伸。
+FIT=fill
 # ATK-DLRV1126B 摄像头 sensor 物理装 +90° 偏角，编码前要旋转 90° 才能让对端看到
 # 直立画面。其他硬件可能不需要补偿，传 --rotate 0 关闭。
 ROTATE=90
@@ -64,6 +70,7 @@ while [ $# -gt 0 ]; do
     --codec)    CODEC="$2"; shift ;;
     --res)      RES="$2"; shift ;;
     --rotate)   ROTATE="$2"; shift ;;
+    --fit)      FIT="$2"; shift ;;
     --aec)      AEC=1 ;;
     --no-aec)   AEC=0 ;;
     --aec-delay) AEC_DELAY_MS="$2"; shift ;;
@@ -122,6 +129,7 @@ export LIVEKIT_TOKEN="$TOKEN"
 export BOARD_LOOPBACK_VIDEO_CODEC="$CODEC"
 export BOARD_LOOPBACK_VIDEO_RES="$RES"
 export BOARD_LOOPBACK_VIDEO_ROTATE="$ROTATE"
+export BOARD_LOOPBACK_VIDEO_FIT="$FIT"
 if [ "$AEC" = "1" ]; then
   export BOARD_LOOPBACK_AEC=1
   export BOARD_LOOPBACK_AEC_DELAY_MS="$AEC_DELAY_MS"
@@ -141,6 +149,7 @@ echo "  url      = $URL"
 echo "  codec    = $CODEC"
 echo "  res      = $RES (sd=360P30 / hd=720P30 / fhd=1080P25)"
 echo "  rotate   = $ROTATE (deg, MPP hardware rotation)"
+echo "  fit      = $FIT (fill=crop center / fit=letterbox / stretch=historic)"
 echo "  use_mpp  = $USE_MPP"
 echo "  aec      = $AEC (delay=${AEC_DELAY_MS}ms; livekit::AudioProcessingModule AEC3+NS+HPF)"
 echo "  bg       = $BG"

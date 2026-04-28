@@ -734,14 +734,118 @@ public:
       }
     }
 
-    // Setplane: scale src_w×src_h to fullscreen
+    // Compute source crop + on-screen rect based on the configured fit
+    // mode. The DRM plane scaler can crop the source (src_x/src_y/src_w/src_h
+    // in 16.16 fixed-point) and project to any rect on the CRTC at zero
+    // CPU cost, so all three modes are pure metadata changes.
+    int crtc_x = 0, crtc_y = 0;
+    int crtc_w = screen_w_, crtc_h = screen_h_;
+    int sx = 0, sy = 0, sw = src_w, sh = src_h;
+    computeFitGeometry(src_w, src_h, crtc_x, crtc_y, crtc_w, crtc_h,
+                       sx, sy, sw, sh);
+
     if (drmModeSetPlane(fd_, plane_id_, crtc_id_, b.fb_id, 0,
-                        /*crtc_x=*/0, /*crtc_y=*/0,
-                        /*crtc_w=*/screen_w_, /*crtc_h=*/screen_h_,
-                        /*src_x=*/0, /*src_y=*/0,
-                        /*src_w=*/src_w << 16, /*src_h=*/src_h << 16) < 0) {
+                        crtc_x, crtc_y, crtc_w, crtc_h,
+                        sx << 16, sy << 16, sw << 16, sh << 16) < 0) {
       std::cerr << "[drm] SetPlane failed: " << std::strerror(errno) << "\n";
     }
+  }
+
+  // Three fit modes (env BOARD_LOOPBACK_VIDEO_FIT, default = fill):
+  //
+  //   fill    aspect-fill: crop a screen-aspect strip from the source's
+  //           centre, project to fullscreen. Source covers the whole
+  //           screen with no black bars; the cropped edges are lost.
+  //           Best for video calls — face usually in the centre.
+  //
+  //   fit     aspect-fit (letterbox): scale the full source to the
+  //           largest rect that fits the screen with the source's
+  //           aspect, leaving black bars on the unused edges. Whatever
+  //           was on the primary plane shows through the bars — without
+  //           a compositor the bars may not be uniformly black, but the
+  //           video itself isn't stretched.
+  //
+  //   stretch source goes fullscreen ignoring aspect (the historic
+  //           behaviour). Easy A/B comparison or for any caller who
+  //           knows the source is already the right aspect.
+  enum class FitMode { Fill, Fit, Stretch };
+  FitMode fitMode() const {
+    static const FitMode m = []() {
+      const char *e = std::getenv("BOARD_LOOPBACK_VIDEO_FIT");
+      if (!e) return FitMode::Fill;
+      const std::string s(e);
+      if (s == "fit") return FitMode::Fit;
+      if (s == "stretch") return FitMode::Stretch;
+      return FitMode::Fill;
+    }();
+    return m;
+  }
+
+  void computeFitGeometry(int src_w, int src_h,
+                          int &crtc_x, int &crtc_y,
+                          int &crtc_w, int &crtc_h,
+                          int &sx, int &sy, int &sw, int &sh) const {
+    crtc_x = 0;
+    crtc_y = 0;
+    crtc_w = screen_w_;
+    crtc_h = screen_h_;
+    sx = 0;
+    sy = 0;
+    sw = src_w;
+    sh = src_h;
+
+    if (fitMode() == FitMode::Stretch) {
+      return; // historic full-stretch
+    }
+
+    // Use 64-bit math to avoid overflow on the cross-multiply comparison
+    // (1920×1080×N can blow int32 in the next product).
+    const std::int64_t src_a = static_cast<std::int64_t>(src_w) * screen_h_;
+    const std::int64_t dst_a = static_cast<std::int64_t>(screen_w_) * src_h;
+
+    if (fitMode() == FitMode::Fill) {
+      // Crop a screen-aspect rect from the source's centre.
+      if (src_a > dst_a) {
+        // Source is wider than screen aspect — shrink crop width.
+        sw = static_cast<int>(
+            (static_cast<std::int64_t>(src_h) * screen_w_) / screen_h_);
+        sx = (src_w - sw) / 2;
+      } else if (src_a < dst_a) {
+        // Source is taller than screen aspect — shrink crop height.
+        sh = static_cast<int>(
+            (static_cast<std::int64_t>(src_w) * screen_h_) / screen_w_);
+        sy = (src_h - sh) / 2;
+      }
+      // Equal aspect → no crop, fullscreen.
+    } else {
+      // Fit (letterbox): keep full source, shrink dest rect.
+      if (src_a > dst_a) {
+        // Source wider — fit width, letterbox top/bottom.
+        crtc_h = static_cast<int>(
+            (static_cast<std::int64_t>(src_h) * screen_w_) / src_w);
+        crtc_y = (screen_h_ - crtc_h) / 2;
+      } else if (src_a < dst_a) {
+        // Source taller — fit height, pillarbox left/right.
+        crtc_w = static_cast<int>(
+            (static_cast<std::int64_t>(src_w) * screen_h_) / src_h);
+        crtc_x = (screen_w_ - crtc_w) / 2;
+      }
+    }
+
+    // NV12 (YUV 4:2:0) chroma sub-sampling requires src crop x/y/w/h
+    // *and* the on-screen crtc rect to be even — otherwise the U/V
+    // planes can't be addressed at the implied sub-pixel and the
+    // driver bails with EINVAL on SetPlane. Round x/y down (so we
+    // don't widen past the picture) and w/h down to even.
+    auto snap_down_even = [](int v) { return v & ~1; };
+    sx = snap_down_even(sx);
+    sy = snap_down_even(sy);
+    sw = snap_down_even(sw);
+    sh = snap_down_even(sh);
+    crtc_x = snap_down_even(crtc_x);
+    crtc_y = snap_down_even(crtc_y);
+    crtc_w = snap_down_even(crtc_w);
+    crtc_h = snap_down_even(crtc_h);
   }
 
   ~DrmDisplay() { close(); }

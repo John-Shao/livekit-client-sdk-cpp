@@ -218,14 +218,74 @@ cb6d524  Phase 6.1.4 packet double-free in Rockchip MPP encoder
 
 ---
 
-## Phase 7 切入候选
+## Phase 7 进度（持续追加）
 
-按价值密度排序（任一都不强制，看后续业务诉求）：
+### 7.1 — MPP H.265 硬编（done 2026-04-27）
+
+Encoder 通用化跟 6.4 decoder 对齐。`RockchipMppH264EncoderImpl` →
+`RockchipMppVideoEncoderImpl` 接 `MppCodingType`，cfg 按 codec 分支
+（h264:* vs h265:* 键名），IDR / 参数集 NAL 解析按 H.264 (bits[4:0])
+和 H.265 (bits[6:1])分别处理，QP parser 用对应 H264/H265 BitstreamParser，
+`CodecSpecificInfo` 在 H.265 路径只填 codecType（这版 webrtc 的
+`CodecSpecificInfoUnion` 没 H265 成员）。Encoder factory 也 advertise
+H.265 + 按 `format.name` dispatch。`smoke.sh --codec h265` 实测板↔手机
+720P30 双向 MPP HEVC 30 秒 904 帧稳定。
+
+### 7.2 — APM 选择性开启（done 2026-04-27）
+
+NS 提到 `kVeryHigh`（默认 kModerate 太弱听不出）+ HPF 开（去 80Hz 以下
+低频），AGC1/AGC2 继续关（保留手动 ES8389 PGA + 8× 软件 gain）。AEC
+**仍关**——根因在 7.3 探索中说清楚了。`BOARD_LOOPBACK_APM_OFF=1` 一键
+回 6.3 全关 baseline 做 A/B。实测 NS 能感知到背景噪声减弱。
+
+### 7.3 — Playback via ADM (尝试后回退 2026-04-28)
+
+**目标**：把 BoardLoopback 自己的 ALSA writer 替换成 SDK 的 ADM driving
+ALSA，让 APM 拿到 render reference 信号让 AEC 真生效。
+
+**实现**：
+
+- `livekit_ffi::AudioDevice` 加 ALSA 驱动：env-gated（`LIVEKIT_ADM_PLAYBACK_DEVICE`）
+  开 ALSA mono、加 writer 线程 + queue 解耦避开 ALSA back-pressure
+- `peer_connection_factory.cpp` 让 AEC 在 env 设了的时候自动开（mobile_mode）
+- BoardLoopback 加 `BOARD_LOOPBACK_ADM_PLAYBACK=1` env：跳过自己的 AlsaPlayer，
+  改让 ADM 拿数据
+- `smoke.sh` 加 `--adm-playback` 选项
+
+**踩到的坑（按出现顺序）**:
+
+1. ADM `NeedMorePlayData` 设 stereo（`kChannels=2`），但板上 PulseAudio→
+   ES8389 路径只接 mono 才稳；不下混就锯木头。改成 ALSA mono + 写入前
+   做 L+R 平均下混。
+2. `n_samples_out` 在这版 webrtc 的语义是**总样本数**（per-channel × channels），
+   不是 per-channel — 名字误导，实际值是 960 不是 480。下标越界触发
+   libstdc++ assertion。修法：clamp `min(n_samples_out, kSamplesPer10Ms)`。
+3. 1s ALSA latency 超出 AEC mobile 工作范围（典型 ~64ms），即使有
+   reference signal AEC 也对齐不上回声。降到 150ms + 实现 `PlayoutDelay()`
+   返回 75ms。
+
+**最终结论：架构跑通了，但 AEC 没产生感知效果**。手机端听到的回声没有
+明显减少，加不加 `--adm-playback` 体感无差异。退出还引入了 segfault
+（MPP teardown 与新增 audio 线程清理时序冲突）。
+
+**根因分析**：BoardLoopback 的 capture 路径走 `AudioTrackSource::capture_frame()`
+→ sinks，这条路径**不进 APM 的 AEC pipeline**。AEC 需要 capture 走 ADM 的
+`RecordedDataIsAvailable()` 才能与 render reference 对齐时间相关。NS 在 7.2
+能起作用是因为它是 capture-side 单向滤波器，路径要求宽松；AEC 是 capture/render
+双向相关算法，路径要求严格得多。
+
+**决策**：revert 全部 7.3 改动回 7.2 baseline。把 capture-via-ADM 留作
+Phase 7.4 的明确范围 — 那才是让 AEC 真正生效的对的入手点。这次的探索
+不是白做，验证了 ADM 可以驱 ALSA、APM 接收 render reference 路径正确，
+为 7.4 铺了一半的路。
+
+### Phase 7 后续候选
+
+按价值密度排序：
 
 1. **dmabuf 零拷贝**（Phase 6.1.5 step C 延伸）：V4L2 capture → MPP encode 同 dmabuf；MPP decode → DRM plane 同 dmabuf。预期单核 ~50%，腾出 CPU 做 AEC / NS
-2. **AEC / NS 选择性开启**：APM 整体关掉是为了不被 AGC 压增益。能不能只关 AGC 留 AEC？webrtc::AudioProcessing 的 sub-config 可独立开关，需要联调测
-3. **板上 H.265 编码**：当前板只用 H.264 编。MPP 也支持 HEVC encode。要让两台板互相 H.265 通话，需要 encoder factory 也走和 decoder factory 同样的多 codec 路径
-4. **Buildroot 包补齐**：`lsb-release` 进 `BR2_PACKAGE_*`；libvpx 静态链上去再瘦点
-5. **长跑测试**：7×24h soak（建议 /schedule agent 开起来），盯 RSS / fd / underrun 累计
+2. **Capture-via-ADM**（Phase 7.4 候选，承接 7.3 探索）：把 BoardLoopback 的 ALSA mic reader + AudioTrackSource::capture_frame 替换成 ADM 的 RecordedDataIsAvailable 路径，让 APM 真正能做 AEC。同时把 7.3 的 ADM 播放也接回来，这次能跑出感知效果
+3. **Buildroot 包补齐**：`lsb-release` 进 `BR2_PACKAGE_*`；libvpx 静态链上去再瘦点
+4. **长跑测试**：7×24h soak（建议 /schedule agent 开起来），盯 RSS / fd / underrun 累计
 
 参考 plan.md §Phase 7 与本文"已知未做项"表对齐。

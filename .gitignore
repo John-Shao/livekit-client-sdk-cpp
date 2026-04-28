@@ -39,3 +39,4 @@ web/
 phase0-host.log
 phase0-board.log
 .claude/scheduled_tasks.lock
+.claude/settings.local.json

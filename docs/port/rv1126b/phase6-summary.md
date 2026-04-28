@@ -238,6 +238,45 @@ NS 提到 `kVeryHigh`（默认 kModerate 太弱听不出）+ HPF 开（去 80Hz 
 **仍关**——根因在 7.3 探索中说清楚了。`BOARD_LOOPBACK_APM_OFF=1` 一键
 回 6.3 全关 baseline 做 A/B。实测 NS 能感知到背景噪声减弱。
 
+### 7.4 — 帧级 AEC via livekit::AudioProcessingModule（done 2026-04-28）
+
+**关键转折**：放弃改 SDK 内部 APM 路径，改用 SDK 已经暴露的
+`livekit::AudioProcessingModule` 类做帧级 AEC。这个 wrapper 跑在
+PCF 的 APM **外面**——我们直接在 BoardLoopback 的 ALSA 读/写路径
+上调用它，AEC3 看到的数据就是真正进入扬声器和从麦克风出来的数据。
+
+**实现**：
+
+- 构造 `AudioProcessingModule({ echo_cancellation, noise_suppression,
+  high_pass_filter })`（AGC 还是关，保留 ES8389 PGA + 8× 软件 gain
+  校准）。`setStreamDelayMs(N)` 一次设好 stream delay hint。
+- AudioStream 回调（远端音频要进 ALSA 之前）：复制 frame，调
+  `processReverseStream` —— APM 拿到播放参考信号
+- audio_thread（ALSA mic 读到 buf 之后、`captureFrame` 之前）：
+  `processStream(frame)` 原地处理，发布的就是消好回声的音频
+- env-gated `BOARD_LOOPBACK_AEC=1`，smoke.sh `--aec` 开关。
+  `--aec-delay <ms>` 调 stream delay。
+
+**实测打分**（双方外放对讲，ATK-DLRV1126B + PulseAudio + ES8389）：
+
+| stream delay | 评分 | 现象 |
+|---|---|---|
+| 100ms | 0/100 | AEC 完全没消（hint 偏离实际太多，AEC 锁不住）|
+| 200ms | 50/100 | 减小但持续有残余 |
+| 300ms | 70/100 | 通话开始阶段漏掉的回声较多 |
+| **400ms** | **90/100** | 最佳，残余只有 AEC3 收敛期前 5-10s |
+| 500ms | 80/100 | 过了，回退一档 |
+
+400ms 比典型手持机大，是因为这个声学链路堆叠：AlsaPlayer 队列
+~50-300ms + PulseAudio ~50ms + ES8389 ~50ms + 房间 + ALSA capture
+~100ms。其他硬件的 delay 不一样，按实际打分挑最优。
+
+**为什么 7.3/7.4-ADM 那两次没行**：把 capture/playback 接到 ADM 后，
+LocalAudioTrack 仍然从 `AudioTrackSource` 拿数据（不从 ADM 经 APM
+处理后的版本拿），所以 AEC 看不到 capture 那一端，没法做 cancel。
+这次绕过 PCF 的 APM、直接在 frame 流上挂 standalone AEC，从架构上
+对了。
+
 ### 7.3 — Playback via ADM (尝试后回退 2026-04-28)
 
 **目标**：把 BoardLoopback 自己的 ALSA writer 替换成 SDK 的 ADM driving
@@ -284,7 +323,7 @@ Phase 7.4 的明确范围 — 那才是让 AEC 真正生效的对的入手点。
 按价值密度排序：
 
 1. **dmabuf 零拷贝**（Phase 6.1.5 step C 延伸）：V4L2 capture → MPP encode 同 dmabuf；MPP decode → DRM plane 同 dmabuf。预期单核 ~50%，腾出 CPU 做 AEC / NS
-2. **Capture-via-ADM**（Phase 7.4 候选，承接 7.3 探索）：把 BoardLoopback 的 ALSA mic reader + AudioTrackSource::capture_frame 替换成 ADM 的 RecordedDataIsAvailable 路径，让 APM 真正能做 AEC。同时把 7.3 的 ADM 播放也接回来，这次能跑出感知效果
+2. **AEC 收敛优化**：当前 7.4 的 90/100 残余主要在 AEC3 启动后 5-10s 收敛期内。可探索：把扬声器音量降下来（`amixer -c 0 cset name='DAC Digital Volume' 140`）减弱回声幅度；麦克风/扬声器物理隔离；或试 Rockchip 厂家的 rk_voice 硬件 AEC
 3. **Buildroot 包补齐**：`lsb-release` 进 `BR2_PACKAGE_*`；libvpx 静态链上去再瘦点
 4. **长跑测试**：7×24h soak（建议 /schedule agent 开起来），盯 RSS / fd / underrun 累计
 

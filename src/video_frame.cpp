@@ -317,21 +317,58 @@ VideoFrame VideoFrame::fromOwnedInfo(const proto::OwnedVideoBuffer &owned) {
   std::vector<std::uint8_t> buffer;
 
   if (info.components_size() > 0) {
-    // Multi-plane (e.g. I420, NV12, etc.). We pack planes back-to-back.
-    std::size_t total_size = 0;
-    for (const auto &comp : info.components()) {
-      total_size += static_cast<std::size_t>(comp.size());
+    // Multi-plane (e.g. I420, NV12). Pack planes back-to-back into a tight
+    // buffer (no per-row padding) so consumers can iterate frame.data()
+    // assuming `stride == row_bytes` per plane — that's the convention
+    // planeInfos() reports and what every existing renderer assumes.
+    //
+    // The FFI side may hand us stride-padded planes (e.g. when Phase 7.6.b's
+    // NV12 fast path passes the source MppBuffer through as-is, MPP's
+    // hor_stride is 16-aligned and exceeds visible width on simulcast
+    // layers like 360x640 → 368x640). A previous version blindly memcpy'd
+    // comp.size bytes, which preserved the padding and produced
+    // diagonally-banded garble at non-aligned resolutions; row-by-row
+    // stride-strip fixes that and matches the destination tight layout
+    // computePlaneInfos already advertises.
+    const std::size_t dst_total = computeBufferSize(width, height, type);
+    buffer.resize(dst_total);
+    const auto dst_planes = computePlaneInfos(
+        reinterpret_cast<uintptr_t>(buffer.data()), width, height, type);
+    if (dst_planes.size() !=
+        static_cast<std::size_t>(info.components_size())) {
+      throw std::runtime_error(
+          "VideoFrame::fromOwnedInfo: plane count mismatch between FFI "
+          "buffer info and computed tight layout");
     }
 
-    buffer.resize(total_size);
-    std::size_t offset = 0;
-    for (const auto &comp : info.components()) {
-      const auto sz = static_cast<std::size_t>(comp.size());
+    for (int i = 0; i < info.components_size(); ++i) {
+      const auto &comp = info.components(i);
+      const auto &dst = dst_planes[i];
+      const std::size_t src_stride = static_cast<std::size_t>(comp.stride());
+      const std::size_t dst_stride = static_cast<std::size_t>(dst.stride);
       const auto src_ptr = reinterpret_cast<const std::uint8_t *>(
           static_cast<std::uintptr_t>(comp.data_ptr()));
+      auto *dst_ptr = reinterpret_cast<std::uint8_t *>(dst.data_ptr);
 
-      std::memcpy(buffer.data() + offset, src_ptr, sz);
-      offset += sz;
+      if (src_stride == dst_stride) {
+        // No padding to strip — bulk memcpy of the full plane.
+        std::memcpy(dst_ptr, src_ptr, dst.size);
+      } else if (src_stride > dst_stride && src_stride > 0) {
+        // FFI plane has per-row padding (e.g. MPP hor_stride > width).
+        // Strip it as we copy: dst_stride bytes per row, advancing src
+        // by src_stride. Row count comes from comp.size, which the FFI
+        // side fills as src_stride * rows.
+        const std::size_t rows = comp.size() / src_stride;
+        for (std::size_t r = 0; r < rows; ++r) {
+          std::memcpy(dst_ptr + r * dst_stride,
+                      src_ptr + r * src_stride, dst_stride);
+        }
+      } else {
+        // Source row narrower than destination tight row — unexpected;
+        // fall back to a bulk memcpy bounded by what we actually have.
+        const std::size_t copy = std::min<std::size_t>(comp.size(), dst.size);
+        std::memcpy(dst_ptr, src_ptr, copy);
+      }
     }
   } else {
     // Packed format: treat top-level data_ptr as a single contiguous buffer.

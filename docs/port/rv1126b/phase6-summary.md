@@ -318,12 +318,62 @@ Phase 7.4 的明确范围 — 那才是让 AEC 真正生效的对的入手点。
 不是白做，验证了 ADM 可以驱 ALSA、APM 接收 render reference 路径正确，
 为 7.4 铺了一半的路。
 
+### 7.5 — encoder NV12 fast path（done 2026-04-28）
+
+V4L2 抓的是 NV12，但 encoder 入口强制 `frame.video_frame_buffer()->ToI420()`，
+然后 `I420ToNV12` 进 MppBuffer——白做了一次 NV12↔I420 round-trip，720P30 ~90 MB/s
+内存搬运。修法：encoder 检测 `kNV12` 入口，直接 stride-strip memcpy 进
+MppBuffer，跳掉 round-trip。**实测 BoardLoopback 单核中位数从 ~100% 掉到 ~80%**（约 −20pp）。
+
+### 7.6 — decoder→DRM 零拷贝（部分完成）
+
+**目标**：消掉解码出口到屏幕之间的三次 NV12 memcpy（解码 → FFI cvt_nv12 → DRM dumb_buf）。
+分三段做，每段独立 commit + 测试。
+
+#### 7.6.a — decoder 出口 zero-copy（done）
+
+新增 `MppNV12Buffer : NV12BufferInterface` wrap MppBuffer，`mpp_buffer_inc_ref`
+持有强引用，下游消费完才 put 回 pool。stride 直接报 MPP 的 `hor_stride`，下游都
+honor stride 没问题。**CPU 中位数 80% → 68%**（−12pp，比预估 3% 高，可能因为 NEON
+对齐路径也跟着省了）。
+
+#### 7.6.b — FFI cvt_nv12 透传（done）
+
+`to_video_buffer_info` 新增 `BufferStorage` enum 区分 `Owned(Box<[u8]>)` / `Native(BoxVideoBuffer)`。
+NV12 → NV12 时直接走 Native 分支：`proto::VideoBufferInfo` 指向源 buffer 的
+pixel memory，FFI handle store 持源 buffer 引用保活。实测 **CPU 中位数 68% → 58%**
+（−10pp）。
+
+#### 7.6.c — DRM dma-buf 直渲（attempt-and-revert）
+
+**目标**：BL 的 DRM 显示用 `drmPrimeFDToHandle` + `drmModeAddFB2` 直接 import MPP buffer 的 dma-buf fd 当 framebuffer，省掉最后一次 dumb_buf memcpy。
+
+**实现**：
+- 新文件 `mpp_dmabuf_registry.{h,cpp}`：进程内 `data_ptr → (fd, hor_stride, ver_stride)` 注册表
+- `MppNV12Buffer` ctor/dtor 维护注册表
+- BL `renderNV12` 加 prime-fd 路径，cache 上一帧 (gem_handle, fb_id) 用于 SetPlane 后清理
+- BL CMakeLists 加 `livekit_ffi` 链接（C 符号在那儿）
+
+**踩坑**：cdylib 的 `--gc-sections` 把 `livekit_mpp_dmabuf_lookup` 整段裁掉了。试过：
+- `__attribute__((used, retain, visibility("default")))` —— 不够
+- `cargo:rustc-link-arg=-Wl,--undefined=...` + `--export-dynamic-symbol=...` —— 不生效
+- Rust extern "C" pub 声明 —— 不算"使用"，rustc 不引用
+
+cdylib 默认只导 Rust `#[no_mangle]` 符号；C 库存档里的 extern "C" 要让它穿透到
+dynamic table，需要更深的 livekit-ffi 导出策略调整（version script、Rust 包装函数
+等），不是 BL 一侧能搞定的。
+
+**决策**：revert 全部 7.6.c 改动。**7.6.a + 7.6.b 已经从 80% 降到 58%（-22pp）**，
+冲 720P30 双向通话 + AEC 已经留下舒适余量。7.6.c 预期 −3 ~ −5pp，工程成本 ≫
+收益。真要做 1080P30 稳定时再正式做（可能需要让 livekit-ffi 暴露 dma-buf-aware
+API，而不是侧通道）。
+
 ### Phase 7 后续候选
 
 按价值密度排序：
 
-1. **dmabuf 零拷贝**（Phase 6.1.5 step C 延伸）：V4L2 capture → MPP encode 同 dmabuf；MPP decode → DRM plane 同 dmabuf。预期单核 ~50%，腾出 CPU 做 AEC / NS
-2. **AEC 收敛优化**：当前 7.4 的 90/100 残余主要在 AEC3 启动后 5-10s 收敛期内。可探索：把扬声器音量降下来（`amixer -c 0 cset name='DAC Digital Volume' 140`）减弱回声幅度；麦克风/扬声器物理隔离；或试 Rockchip 厂家的 rk_voice 硬件 AEC
+1. **AEC 收敛优化**：当前 7.4 的 90/100 残余主要在 AEC3 启动后 5-10s 收敛期内。可探索：把扬声器音量降下来（`amixer -c 0 cset name='DAC Digital Volume' 140`）减弱回声幅度；麦克风/扬声器物理隔离；或试 Rockchip 厂家的 rk_voice 硬件 AEC
+2. **DRM dma-buf 直渲（7.6.c v2）**：等 1080P30 真需要时再做。前置工作是把 livekit-ffi 的 cdylib 加一条"额外导出 C 符号"的 build-script 入口（修 ffi-node-bindings 的版本脚本或加一个公共 shim 模块）
 3. **Buildroot 包补齐**：`lsb-release` 进 `BR2_PACKAGE_*`；libvpx 静态链上去再瘦点
 4. **长跑测试**：7×24h soak（建议 /schedule agent 开起来），盯 RSS / fd / underrun 累计
 

@@ -12,7 +12,7 @@
 #
 # 用法:
 #   ./smoke.sh                    MPP H.264 双向硬件, HD 720P30, AEC 开 (默认)
-#   ./smoke.sh --res sd           切 480P30   (640x480 @ 30fps)
+#   ./smoke.sh --res sd           切 360P30   (640x360 @ 30fps，16:9)
 #   ./smoke.sh --res hd           切 720P30   (1280x720 @ 30fps，默认)
 #   ./smoke.sh --res fhd          切 1080P25  (1920x1080 @ 25fps)
 #   ./smoke.sh --rotate 0         关掉默认 +90° 补偿（其他硬件 / sensor 装正了的板）
@@ -139,7 +139,7 @@ fi
 echo "==== smoke ===="
 echo "  url      = $URL"
 echo "  codec    = $CODEC"
-echo "  res      = $RES (sd=480P30 / hd=720P30 / fhd=1080P25)"
+echo "  res      = $RES (sd=360P30 / hd=720P30 / fhd=1080P25)"
 echo "  rotate   = $ROTATE (deg, MPP hardware rotation)"
 echo "  use_mpp  = $USE_MPP"
 echo "  aec      = $AEC (delay=${AEC_DELAY_MS}ms; livekit::AudioProcessingModule AEC3+NS+HPF)"

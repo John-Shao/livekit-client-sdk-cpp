@@ -278,10 +278,16 @@ cde4547  bump client-sdk-rust to Phase 7.1 — MPP H.265 encode
 
 按价值密度排序（任一都不强制，看后续业务诉求）：
 
-1. **AEC 收敛优化**：降扬声器音量、物理隔离麦/喇叭、试 Rockchip 厂家 rk_voice 硬件 AEC
+1. **AEC 收敛优化**：降扬声器音量、物理隔离麦/喇叭、试 Rockchip 厂家 rk_voice 硬件 AEC（TODO 联系厂商）
 2. **DRM dma-buf 直渲（7.6.c v2）**：等 1080P30 真需要时再做。前置工作是把
    livekit-ffi 的 cdylib 加一条"额外导出 C 符号"的 build-script 入口（修
    ffi-node-bindings 的版本脚本或加一个公共 shim 模块）
-3. **Buildroot 包补齐**：`lsb-release` 进 `BR2_PACKAGE_*`；libvpx 静态链上去再瘦点
+3. ~~**Buildroot 包补齐**~~ — 调研后删除。当时怀疑两件事：(a) `lsb-release`
+   进 Buildroot 解决 `os_version=Unknown`，(b) libvpx 静态链上去瘦 .so。
+   实测两件都不成立：libvpx 已经在 `libwebrtc.a` 里静态进了 .so（没有再
+   瘦空间）；`lsb_release` 即便手动 shim 上去，`os_info` crate 3.14.0 也
+   不认 `Distributor ID: Buildroot`（它有 distro whitelist，未识别就回
+   Unknown），警告消不掉。要消这条警告得 patch `os_info` 或在 livekit-api
+   绕开它直接读 `/etc/os-release`，不属于 Buildroot 范畴。
 4. **长跑测试**：7×24h soak（建议 /schedule agent 开起来），盯 RSS / fd / underrun 累计
 5. **业务集成**：Phase 7 阶段板↔Web 通话已稳定，可以开始接产品业务逻辑（房间管理 / 多人 / 数据通道等）

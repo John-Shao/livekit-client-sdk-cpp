@@ -1,6 +1,6 @@
 # Phase 7 工作总结 — codec 对称化、AEC 落地、解码侧零拷贝 ✅
 
-> **状态**：核心目标全部完成，HD 720P30 双向通话 + AEC 在线，单核中位数从 ~100% 降到 ~58%
+> **状态**：核心目标全部完成，HD 720P30 双向通话 + AEC 在线，单核中位数从 ~100% 降到 ~58%（270s 短测；2h 长跑稳态实测 ~103%，详见 [phase8-summary.md](phase8-summary.md) 8.2）
 > 完成日期：2026-04-28
 > 分支：`port/rv1126b-phase-0-recon`（superproject）/ `port/rv1126b-mpp`（client-sdk-rust）
 > 关联文档：[plan.md](plan.md) · [phase5-summary.md](phase5-summary.md) · [phase6-summary.md](phase6-summary.md) · [oplog.md](oplog.md)
@@ -208,7 +208,7 @@ Rust 包装函数等），不是 BL 一侧能搞定的。
 final  video=N audio=M     ← 30 fps 双向稳定
 ```
 
-**CPU 单核中位数演进（HD 720P30 双向 + AEC）**:
+**CPU 单核中位数演进（HD 720P30 双向 + AEC，270s 短测）**:
 
 | | CPU 中位数 | Δ | 备注 |
 |---|---|---|---|
@@ -219,6 +219,13 @@ final  video=N audio=M     ← 30 fps 双向稳定
 
 总计 **-42pp**（从满核到 ~58%）。同时 AEC 在线（~+15pp APM 成本，已包含在
 58% 内），留出 ~40pp 的 headroom 给业务层。
+
+> ⚠️ **重要补正（Phase 8.2 长跑实测）**：上面这套 "~58%" 数字是 270s 短测拿到的，
+> codec/AEC 都没真正进入稳态。Phase 8.2 做 2h soak 之后，**真稳态 CPU 中位
+> 数 ~103%（单核 metric，跑在 ~1.03 个核上）**——比短测高一倍。该 Web peer
+> 单 peer 720P30 + AEC + DRM 显示这条配置的真稳态基线 **= ~103%**，未来调优
+> 的对比起点要用这个。短测 ~58% 不是错的（那个时刻 CPU 确实还没爬上来），
+> 但拿来做容量规划会**严重低估**。详见 [phase8-summary.md](phase8-summary.md) 8.2 段。
 
 ## 已知未做项 / 边界
 

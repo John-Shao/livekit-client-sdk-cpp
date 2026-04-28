@@ -708,6 +708,12 @@ public:
     if (src_w < 64 || src_h < 64) {
       return;
     }
+    // Phase 8.4.1: 多 peer 场景下，多个 video track callback 并发调
+    // renderNV12 → ensureBuffers 检测到 size 变化时 free/realloc dumb
+    // buffer，另一路 callback 拿着已 free 的 mapped 指针写入触发 segv。
+    // 实践中 99% 的 callback 在 VideoRouter::renderIfActive 入口就被
+    // 早 return 不会进这里，但即便如此也要兜底加锁。
+    std::lock_guard<std::mutex> render_lock(render_mutex_);
     if (!ensureBuffers(src_w, src_h))
       return;
     DumbBuf &b = bufs_[next_];
@@ -912,10 +918,72 @@ private:
   int next_ = 0;
   int buf_w_ = 0;
   int buf_h_ = 0;
+  // Phase 8.4.1：保护 ensureBuffers 的 free/realloc 临界区，防多 peer
+  // 并发 callback use-after-free。
+  std::mutex render_mutex_;
 };
 
 static DrmDisplay g_drm;
 static std::atomic<bool> g_drm_ok{false};
+
+// VideoRouter — Phase 8.4.1
+// ---------------------------------------------------------------
+// 多 peer 时 BoardLoopback 是单显示器 = 同一时间只能放一路远端视频。
+// 每个 peer 的 video track callback 进来都问 router："我是 active 吗？"
+// 不是 active 直接 return，是 active 才进 DrmDisplay 临界区渲染。
+//
+// 8.4.1 MVP 行为：第一个 peer 自动成为 active；setActive 可手动切换
+// （8.4.2 会接到 onActiveSpeakersChanged 自动切换）。peer 离开时
+// resetIfActive 清空 active_id，下一个 peer frame 接管。
+class VideoRouter {
+public:
+  void renderIfActive(const std::string &id, const std::uint8_t *data,
+                      int w, int h) {
+    bool match;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (active_id_.empty()) {
+        active_id_ = id;
+        std::cout << "[router] first peer wins active: " << id << "\n";
+      }
+      match = (id == active_id_);
+    }
+    if (!match)
+      return;
+    g_drm.renderNV12(data, w, h);
+  }
+
+  // 设置 active peer id；空字符串表示无 active（下一个进来的 peer 会
+  // 自动接管）。8.4.2 active speaker handler 会从这里切。
+  void setActive(const std::string &id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (active_id_ != id) {
+      std::cout << "[router] active: '" << active_id_ << "' -> '" << id
+                << "'\n";
+      active_id_ = id;
+    }
+  }
+
+  // peer 离开时调用：如果它是当前 active，清空让下一个 frame 接管。
+  void resetIfActive(const std::string &id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (active_id_ == id) {
+      std::cout << "[router] active peer '" << id << "' left, clearing\n";
+      active_id_.clear();
+    }
+  }
+
+  std::string getActive() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return active_id_;
+  }
+
+private:
+  mutable std::mutex mu_;
+  std::string active_id_;
+};
+
+static VideoRouter g_video_router;
 
 class LoopbackDelegate : public RoomDelegate {
 public:
@@ -930,8 +998,11 @@ public:
   void onParticipantDisconnected(
       Room &, const ParticipantDisconnectedEvent &ev) override {
     if (ev.participant) {
-      std::cout << "[loopback] participant disconnected: "
-                << ev.participant->identity() << "\n";
+      const std::string id = ev.participant->identity();
+      std::cout << "[loopback] participant disconnected: " << id << "\n";
+      // Phase 8.4.1: 如果离开的是当前 active 渲染的 peer，清空 router；
+      // 下一个还在房间里的 peer 的下一帧到来时自动接管。
+      g_video_router.resetIfActive(id);
     }
   }
 
@@ -964,15 +1035,15 @@ public:
       vopts.capacity = 8; // ring buffer 防止积压
       room.setOnVideoFrameCallback(
           identity, track_name,
-          [stats](const VideoFrame &frame, std::int64_t /*ts*/) {
+          [stats, identity](const VideoFrame &frame, std::int64_t /*ts*/) {
             stats->video_frames.fetch_add(1, std::memory_order_relaxed);
             if (!g_drm_ok.load(std::memory_order_relaxed) ||
                 frame.type() != VideoBufferType::NV12)
               return;
-            // NV12 contiguous: data() = Y plane (w*h bytes), then UV plane
-            // (w*h/2 bytes interleaved). renderNV12 expects exactly this
-            // contiguous layout.
-            g_drm.renderNV12(frame.data(), frame.width(), frame.height());
+            // Phase 8.4.1: 多 peer 走 router 网关，仅 active peer 进入
+            // DrmDisplay。NV12 contiguous: data() = Y (w*h) + UV (w*h/2)。
+            g_video_router.renderIfActive(identity, frame.data(),
+                                          frame.width(), frame.height());
           },
           vopts);
     } else if (kind == TrackKind::KIND_AUDIO) {

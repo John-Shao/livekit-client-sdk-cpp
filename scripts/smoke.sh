@@ -11,7 +11,7 @@
 # 任一缺失则后退到下一项；都没有则报错退出。
 #
 # 用法:
-#   ./smoke.sh                    MPP H.264 双向硬件, HD 720P30 (默认)
+#   ./smoke.sh                    MPP H.264 双向硬件, HD 720P30, AEC 开 (默认)
 #   ./smoke.sh --res sd           切 480P30   (640x480 @ 30fps)
 #   ./smoke.sh --res hd           切 720P30   (1280x720 @ 30fps，默认)
 #   ./smoke.sh --res fhd          切 1080P25  (1920x1080 @ 25fps)
@@ -21,8 +21,9 @@
 #   ./smoke.sh --rotate 270       逆时针 90°
 #   ./smoke.sh --no-mpp           关 MPP，走 OpenH264/libvpx 软 codec
 #   ./smoke.sh --codec vp8        切 publish codec (h264/vp8/vp9/h265)
-#   ./smoke.sh --aec              开帧级 AEC (livekit::AudioProcessingModule AEC3+NS+HPF)
-#   ./smoke.sh --aec --aec-delay 250  AEC + 调 stream delay（默认 200ms）
+#   ./smoke.sh                    AEC 默认开 (livekit::AudioProcessingModule AEC3+NS+HPF, 400ms delay)
+#   ./smoke.sh --no-aec           关 AEC（A/B 对照或排查 AEC 误消语音）
+#   ./smoke.sh --aec-delay 300    调 stream delay（默认 400ms，实测在本板最佳）
 #   ./smoke.sh --token <JWT>      显式传 token
 #   ./smoke.sh --bg               后台跑，日志写到 /tmp/smoke.log
 #   ./smoke.sh --tail             追看最近一次后台跑的日志
@@ -42,13 +43,14 @@ RES=hd
 ROTATE=90
 # Phase 7.4: 帧级 AEC (livekit::AudioProcessingModule)。开启后对每帧
 # capture/playback 主动调 APM (AEC3 + NS + HPF)，让 AEC 看到完整双向
-# 信号，消除扬声器→麦克风的回声循环。默认 0 沿用 7.2 行为；--aec 打开。
+# 信号，消除扬声器→麦克风的回声循环。默认开启（双方外放体验提升明显）；
+# --no-aec 可关掉做对照（验证之前的回声问题或排查 AEC 误消语音）。
 #
 # AEC_DELAY_MS 是 stream delay hint —— ATK-DLRV1126B 实测最佳 400ms
 # (90/100 分；100ms=0 / 200ms=50 / 300ms=70 / 400ms=90 / 500ms=80)。
 # 链路较长是因为 AlsaPlayer ~50-300ms + PulseAudio ~50ms + ES8389
 # ~50ms + ALSA capture ~100ms。其他硬件请按实际重新打分挑最优值。
-AEC=0
+AEC=1
 AEC_DELAY_MS=400
 TOKEN=""
 BG=0
@@ -63,6 +65,7 @@ while [ $# -gt 0 ]; do
     --res)      RES="$2"; shift ;;
     --rotate)   ROTATE="$2"; shift ;;
     --aec)      AEC=1 ;;
+    --no-aec)   AEC=0 ;;
     --aec-delay) AEC_DELAY_MS="$2"; shift ;;
     --token)    TOKEN="$2"; shift ;;
     --url)      URL="$2"; shift ;;

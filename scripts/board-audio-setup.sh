@@ -19,13 +19,13 @@
 #   DAC  (扬声器 playback 音量, numid=48/49)
 #     范围 0-255, step 0.5 dB, base -95.5 dB
 #     191 = 0 dB (unity), 171 = -10 dB, 151 = -20 dB
-#     默认 171 = -10 dB，实测扬声器播放手机来的声音音量适中
-#     嫌响→ env DAC=161 ./board-audio-setup.sh   (-15 dB)
-#     嫌轻→ env DAC=181 ./board-audio-setup.sh   (-5 dB)
+#     默认 186 = -2.5 dB
+#     嫌响→ env DAC=181 ./board-audio-setup.sh   (-5 dB)
+#     嫌轻→ env DAC=191 ./board-audio-setup.sh   (0 dB, unity)
 set -e
 
 PGA=${PGA:-9}
-DAC=${DAC:-171}
+DAC=${DAC:-186}
 
 amixer -c 0 cset numid=39 "$PGA" > /dev/null  # ADCL PGA Volume (mic +N*3 dB)
 amixer -c 0 cset numid=40 "$PGA" > /dev/null  # ADCR PGA Volume

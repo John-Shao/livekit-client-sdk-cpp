@@ -106,8 +106,8 @@ fi
 # 跟 board-audio-setup.sh 一致；冗余 set 一遍兜底（即便 alsactl restore 失败）。
 amixer -c 0 cset numid=39 9   > /dev/null 2>&1 || true  # ADCL PGA = +27 dB
 amixer -c 0 cset numid=40 9   > /dev/null 2>&1 || true  # ADCR PGA = +27 dB
-amixer -c 0 cset numid=48 171 > /dev/null 2>&1 || true  # DACL = -10 dB
-amixer -c 0 cset numid=49 171 > /dev/null 2>&1 || true  # DACR = -10 dB
+amixer -c 0 cset numid=48 186 > /dev/null 2>&1 || true  # DACL = -2.5 dB
+amixer -c 0 cset numid=49 186 > /dev/null 2>&1 || true  # DACR = -2.5 dB
 
 # ---- 杀残留 ----
 pkill -f BoardLoopback 2>/dev/null || true

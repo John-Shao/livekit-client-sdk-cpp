@@ -26,7 +26,8 @@
 #   ./smoke.sh --codec vp8        切 publish codec (h264/vp8/vp9/h265)
 #   ./smoke.sh                    AEC 默认开 (livekit::AudioProcessingModule AEC3+NS+HPF, 400ms delay)
 #   ./smoke.sh --no-aec           关 AEC（A/B 对照或排查 AEC 误消语音）
-#   ./smoke.sh --aec-delay 300    调 stream delay（默认 400ms，实测在本板最佳）
+#   ./smoke.sh --aec-delay 300    stream delay (默认 300ms，2026-04-28 sweep 验证)
+#   ./smoke.sh --dac 155          DAC 喇叭音量 (默认 155=-18dB，AEC 收敛 sweet spot)
 #   ./smoke.sh --token <JWT>      显式传 token
 #   ./smoke.sh --bg               后台跑，日志写到 /tmp/smoke.log
 #   ./smoke.sh --tail             追看最近一次后台跑的日志
@@ -44,6 +45,18 @@ RES=hd
 # 远端推过来的画面在屏幕上如何贴：fill 默认（裁中央竖条不留黑边）/ fit
 # letterbox（保留全部源，加黑边）/ stretch 历史拉伸。
 FIT=fill
+# DAC 喇叭播放音量（ES8389 numid=48/49，0..255；step 0.5 dB；191=0 dB ref）。
+# 默认 155 (-18 dB) —— 2026-04-28 AEC 收敛 sweep 找到的 sweet spot。
+# 压低喇叭 → 物理回声幅度变小 → AEC 有效延迟也跟着短 → 收敛更快、残余更小。
+# Sweep 结果（每组同样的双向对话脚本，对端打分；推送音量在 155 时不退化）:
+#   DAC 186 / delay 400  →  音爆（之前的旧默认，喇叭过响）
+#   DAC 181-171 / 400    →  回声明显
+#   DAC 171-165 / 350    →  低弱回声
+#   DAC 165 / 300        →  开头有回声
+#   DAC 161 / 300        →  开头有低弱回声
+#   DAC 155 / 300        →  回声消除 ✅（最终默认）
+# 其他硬件请按本套打分流程重新 sweep——AEC 最佳点跟回声路径耦合，不通用。
+DAC=155
 # ATK-DLRV1126B 摄像头 sensor 物理装 +90° 偏角，编码前要旋转 90° 才能让对端看到
 # 直立画面。其他硬件可能不需要补偿，传 --rotate 0 关闭。
 ROTATE=90
@@ -52,12 +65,12 @@ ROTATE=90
 # 信号，消除扬声器→麦克风的回声循环。默认开启（双方外放体验提升明显）；
 # --no-aec 可关掉做对照（验证之前的回声问题或排查 AEC 误消语音）。
 #
-# AEC_DELAY_MS 是 stream delay hint —— ATK-DLRV1126B 实测最佳 400ms
-# (90/100 分；100ms=0 / 200ms=50 / 300ms=70 / 400ms=90 / 500ms=80)。
-# 链路较长是因为 AlsaPlayer ~50-300ms + PulseAudio ~50ms + ES8389
-# ~50ms + ALSA capture ~100ms。其他硬件请按实际重新打分挑最优值。
+# AEC_DELAY_MS 是 stream delay hint —— 跟 DAC 喇叭音量耦合：喇叭压得低，
+# 物理回声路径短，最佳 delay 也跟着小。2026-04-28 sweep 找到的 sweet
+# spot = (DAC=155, delay=300)，回声完全消除且对端听我们音量不退化。详见
+# 上面 DAC 注释里的 sweep 表。换其他硬件 / 改了喇叭距离都要重新打分。
 AEC=1
-AEC_DELAY_MS=400
+AEC_DELAY_MS=300
 TOKEN=""
 BG=0
 LOG=/tmp/smoke.log
@@ -74,6 +87,7 @@ while [ $# -gt 0 ]; do
     --aec)      AEC=1 ;;
     --no-aec)   AEC=0 ;;
     --aec-delay) AEC_DELAY_MS="$2"; shift ;;
+    --dac)      DAC="$2"; shift ;;
     --token)    TOKEN="$2"; shift ;;
     --url)      URL="$2"; shift ;;
     --bg)       BG=1 ;;
@@ -113,8 +127,8 @@ fi
 # 跟 board-audio-setup.sh 一致；冗余 set 一遍兜底（即便 alsactl restore 失败）。
 amixer -c 0 cset numid=39 9   > /dev/null 2>&1 || true  # ADCL PGA = +27 dB
 amixer -c 0 cset numid=40 9   > /dev/null 2>&1 || true  # ADCR PGA = +27 dB
-amixer -c 0 cset numid=48 186 > /dev/null 2>&1 || true  # DACL = -2.5 dB
-amixer -c 0 cset numid=49 186 > /dev/null 2>&1 || true  # DACR = -2.5 dB
+amixer -c 0 cset numid=48 "$DAC" > /dev/null 2>&1 || true  # DACL
+amixer -c 0 cset numid=49 "$DAC" > /dev/null 2>&1 || true  # DACR
 
 # ---- 杀残留 ----
 pkill -f BoardLoopback 2>/dev/null || true
@@ -152,6 +166,7 @@ echo "  rotate   = $ROTATE (deg, MPP hardware rotation)"
 echo "  fit      = $FIT (fill=crop center / fit=letterbox / stretch=historic)"
 echo "  use_mpp  = $USE_MPP"
 echo "  aec      = $AEC (delay=${AEC_DELAY_MS}ms; livekit::AudioProcessingModule AEC3+NS+HPF)"
+echo "  dac      = $DAC (ES8389 numid=48/49; 155=-18dB default / 191=0dB ref)"
 echo "  bg       = $BG"
 echo "  log      = $LOG (only when --bg)"
 echo "==============="

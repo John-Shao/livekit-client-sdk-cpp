@@ -18,14 +18,15 @@
 #
 #   DAC  (扬声器 playback 音量, numid=48/49)
 #     范围 0-255, step 0.5 dB, base -95.5 dB
-#     191 = 0 dB (unity), 171 = -10 dB, 151 = -20 dB
-#     默认 186 = -2.5 dB
-#     嫌响→ env DAC=181 ./board-audio-setup.sh   (-5 dB)
-#     嫌轻→ env DAC=191 ./board-audio-setup.sh   (0 dB, unity)
+#     191 = 0 dB (unity), 171 = -10 dB, 155 = -18 dB, 151 = -20 dB
+#     默认 155 = -18 dB（2026-04-28 AEC 收敛 sweep 找到的 sweet spot；
+#     喇叭过响时 AEC 消不干净回声，压低让 AEC 工作量减轻）
+#     嫌轻→ env DAC=171 ./board-audio-setup.sh   (-10 dB) 或 191 (0 dB)
+#     注意：调高 DAC 同时一般要把 smoke.sh 的 --aec-delay 抬上去配合
 set -e
 
 PGA=${PGA:-9}
-DAC=${DAC:-186}
+DAC=${DAC:-155}
 
 amixer -c 0 cset numid=39 "$PGA" > /dev/null  # ADCL PGA Volume (mic +N*3 dB)
 amixer -c 0 cset numid=40 "$PGA" > /dev/null  # ADCR PGA Volume

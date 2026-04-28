@@ -21,6 +21,8 @@
 #   ./smoke.sh --rotate 270       逆时针 90°
 #   ./smoke.sh --no-mpp           关 MPP，走 OpenH264/libvpx 软 codec
 #   ./smoke.sh --codec vp8        切 publish codec (h264/vp8/vp9/h265)
+#   ./smoke.sh --aec              开帧级 AEC (livekit::AudioProcessingModule AEC3+NS+HPF)
+#   ./smoke.sh --aec --aec-delay 250  AEC + 调 stream delay（默认 200ms）
 #   ./smoke.sh --token <JWT>      显式传 token
 #   ./smoke.sh --bg               后台跑，日志写到 /tmp/smoke.log
 #   ./smoke.sh --tail             追看最近一次后台跑的日志
@@ -38,6 +40,16 @@ RES=hd
 # ATK-DLRV1126B 摄像头 sensor 物理装 +90° 偏角，编码前要旋转 90° 才能让对端看到
 # 直立画面。其他硬件可能不需要补偿，传 --rotate 0 关闭。
 ROTATE=90
+# Phase 7.4: 帧级 AEC (livekit::AudioProcessingModule)。开启后对每帧
+# capture/playback 主动调 APM (AEC3 + NS + HPF)，让 AEC 看到完整双向
+# 信号，消除扬声器→麦克风的回声循环。默认 0 沿用 7.2 行为；--aec 打开。
+#
+# AEC_DELAY_MS 是 stream delay hint —— ATK-DLRV1126B 实测最佳 400ms
+# (90/100 分；100ms=0 / 200ms=50 / 300ms=70 / 400ms=90 / 500ms=80)。
+# 链路较长是因为 AlsaPlayer ~50-300ms + PulseAudio ~50ms + ES8389
+# ~50ms + ALSA capture ~100ms。其他硬件请按实际重新打分挑最优值。
+AEC=0
+AEC_DELAY_MS=400
 TOKEN=""
 BG=0
 LOG=/tmp/smoke.log
@@ -50,6 +62,8 @@ while [ $# -gt 0 ]; do
     --codec)    CODEC="$2"; shift ;;
     --res)      RES="$2"; shift ;;
     --rotate)   ROTATE="$2"; shift ;;
+    --aec)      AEC=1 ;;
+    --aec-delay) AEC_DELAY_MS="$2"; shift ;;
     --token)    TOKEN="$2"; shift ;;
     --url)      URL="$2"; shift ;;
     --bg)       BG=1 ;;
@@ -105,6 +119,13 @@ export LIVEKIT_TOKEN="$TOKEN"
 export BOARD_LOOPBACK_VIDEO_CODEC="$CODEC"
 export BOARD_LOOPBACK_VIDEO_RES="$RES"
 export BOARD_LOOPBACK_VIDEO_ROTATE="$ROTATE"
+if [ "$AEC" = "1" ]; then
+  export BOARD_LOOPBACK_AEC=1
+  export BOARD_LOOPBACK_AEC_DELAY_MS="$AEC_DELAY_MS"
+else
+  unset BOARD_LOOPBACK_AEC
+  unset BOARD_LOOPBACK_AEC_DELAY_MS
+fi
 if [ "$USE_MPP" = "1" ]; then
   export BOARD_LOOPBACK_USE_MPP=1
 else
@@ -118,6 +139,7 @@ echo "  codec    = $CODEC"
 echo "  res      = $RES (sd=480P30 / hd=720P30 / fhd=1080P25)"
 echo "  rotate   = $ROTATE (deg, MPP hardware rotation)"
 echo "  use_mpp  = $USE_MPP"
+echo "  aec      = $AEC (delay=${AEC_DELAY_MS}ms; livekit::AudioProcessingModule AEC3+NS+HPF)"
 echo "  bg       = $BG"
 echo "  log      = $LOG (only when --bg)"
 echo "==============="

@@ -18,6 +18,7 @@
  */
 
 #include "livekit/audio_frame.h"
+#include "livekit/audio_processing_module.h"
 #include "livekit/audio_source.h"
 #include "livekit/livekit.h"
 #include "livekit/local_audio_track.h"
@@ -161,6 +162,24 @@ private:
 };
 
 static StatsRegistry g_stats;
+
+// Phase 7.4: explicit, frame-level Acoustic Echo Cancellation via the SDK's
+// standalone livekit::AudioProcessingModule (AEC3 + NS + HPF). The wrapper
+// runs *outside* the PCF's internal APM — we feed it the playback frame via
+// processReverseStream() before snd_pcm_writei, and the captured mic frame
+// via processStream() before audio_source->captureFrame(). With both ends
+// fed and a delay hint set via setStreamDelayMs, AEC3 can subtract the
+// speaker→mic acoustic loop.
+//
+// Two earlier attempts (Phase 7.3 ADM-driven playback, Phase 7.4 ADM-driven
+// capture+playback) both wired the SDK's internal APM but didn't deliver
+// perceptible echo cancellation — the LocalAudioTrack ends up taking audio
+// from AudioTrackSource's sink chain regardless, which doesn't pass through
+// AEC even when ADM does. Bypassing PCF's APM and using the explicit module
+// here puts AEC right where the data flows.
+static std::unique_ptr<AudioProcessingModule> g_apm;
+static int g_apm_delay_ms = 0;
+static std::atomic<bool> g_apm_ready{false};
 
 // ---------------------------------------------------------------
 // ALSA player: lazy-init PCM playback to plughw:0,0 (ES8389 codec on
@@ -869,6 +888,23 @@ public:
                         << frame.samples_per_channel() << " buf_size="
                         << frame.data().size() << "\n";
             }
+            // Phase 7.4: feed APM the playback frame as reverse stream
+            // BEFORE we hand it to ALSA — APM uses this as the AEC
+            // reference signal it'll subtract from the mic-side capture
+            // a few hundred ms later (delay set via setStreamDelayMs).
+            // We pass a copy because processReverseStream modifies in-
+            // place; the original frame is what we actually play.
+            if (g_apm_ready.load()) {
+              AudioFrame reverse_copy(frame.data(), frame.sample_rate(),
+                                     frame.num_channels(),
+                                     frame.samples_per_channel());
+              try {
+                g_apm->processReverseStream(reverse_copy);
+              } catch (const std::exception &e) {
+                std::cerr << "[loopback] APM processReverseStream err: "
+                          << e.what() << "\n";
+              }
+            }
             // 把远端音频写到板上 ALSA codec (ES8389)，让 board 真的
             // "开口"。lazy-init 用第一帧的 sample_rate/channels。
             if (g_alsa.ensureOpen(frame.sample_rate(), frame.num_channels())) {
@@ -901,6 +937,48 @@ int main(int argc, char *argv[]) {
 #endif
 
   livekit::initialize(LogLevel::Info, LogSink::kConsole);
+
+  // Phase 7.4: opt-in standalone APM for echo cancellation. Active when
+  // BOARD_LOOPBACK_AEC=1; tuning via BOARD_LOOPBACK_AEC_DELAY_MS.
+  //
+  // Default = 400ms based on empirical scoring on the ATK-DLRV1126B with
+  // PulseAudio→ES8389 path:
+  //
+  //   100ms → 0/100 (no cancellation; AEC's hint is too far off the real
+  //                  acoustic round-trip for adaptive delay to lock)
+  //   200ms → 50/100 (echo reduced but always present)
+  //   300ms → 70/100 (occasional misses early in the call)
+  //   400ms → 90/100 ★ — best score, residual is only the AEC3
+  //                       convergence window (~first 5-10s)
+  //   500ms → 80/100 (back-slides — overshoots actual delay)
+  //
+  // The 400ms figure is much higher than typical handset values because
+  // this board's audio chain stacks: AlsaPlayer queue (~50-300ms) →
+  // PulseAudio (~50ms) → ES8389 buffer (~50ms) → speaker → room → mic
+  // → ALSA capture (~100ms). Override via BOARD_LOOPBACK_AEC_DELAY_MS
+  // for hardware variants with a different chain.
+  if (const char *e = std::getenv("BOARD_LOOPBACK_AEC");
+      e && std::string(e) == "1") {
+    AudioProcessingModule::Options opts;
+    opts.echo_cancellation = true;
+    opts.noise_suppression = true;
+    opts.high_pass_filter = true;
+    // Keep AGC off — our hardware ES8389 PGA + 8× software gain calibration
+    // already handles levels; AGC would attenuate it (the original
+    // "from-the-earpiece" regression).
+    opts.auto_gain_control = false;
+    g_apm = std::make_unique<AudioProcessingModule>(opts);
+    g_apm_delay_ms = 400;
+    if (const char *d = std::getenv("BOARD_LOOPBACK_AEC_DELAY_MS")) {
+      try {
+        g_apm_delay_ms = std::stoi(d);
+      } catch (...) { /* keep default */ }
+    }
+    g_apm->setStreamDelayMs(g_apm_delay_ms);
+    g_apm_ready.store(true);
+    std::cout << "[loopback] APM AEC enabled (echo_cancellation + noise_suppression"
+                 " + high_pass_filter), delay_ms=" << g_apm_delay_ms << "\n";
+  }
 
   // Try to take over the DRM device for direct video plane rendering.
   // Skip with BOARD_LOOPBACK_NO_DRM=1 if running headless or weston
@@ -1130,6 +1208,17 @@ int main(int argc, char *argv[]) {
 
       AudioFrame frame(buf, kAudioSampleRate, kAudioChannels,
                        kAudioSamplesPerChannel);
+      // Phase 7.4: run the captured mic frame through APM. AEC subtracts
+      // the speaker reference signal it learned from processReverseStream,
+      // NS removes background noise, HPF cuts <80Hz rumble — all in-place.
+      // The processed buffer is what we publish to remote.
+      if (g_apm_ready.load()) {
+        try {
+          g_apm->processStream(frame);
+        } catch (const std::exception &e) {
+          std::cerr << "[loopback] APM processStream err: " << e.what() << "\n";
+        }
+      }
       try {
         audio_source->captureFrame(frame, /*timeout_ms=*/100);
       } catch (const std::exception &e) {

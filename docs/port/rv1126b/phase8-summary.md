@@ -150,7 +150,7 @@ Phase 7 文档"~58%"是 270s 短测，那时 codec/AEC/MPP buffer pool 都没真
 | **8.4.3** | 音频软混音器（pull 模型 + AEC reverse on mix）| ✅ 完成 2026-04-29 |
 | **8.4.4-MVP** | HTTP API 极简版 + Bearer auth | ✅ 完成 2026-04-29 |
 | **8.4.4-完整** | Daemon 化 + per-meeting FFI lifecycle + Room::Disconnect | ✅ 完成 2026-04-29 |
-| 8.4.2-完整 | hold-down 600ms + 切换体验优化 | ⏳ |
+| **8.4.2-完整** | hold-down 600ms + render-only switch（避开 FFI heap bug） | ✅ 完成 2026-04-29 |
 | 8.4.5 | 触控 UI（OSD-on-video MVP） | ⏳ |
 | 8.4.6 | 集成测试 + 多人 4h soak | ⏳ |
 
@@ -401,18 +401,55 @@ T~5s 第二轮会议正常工作（视频 + 音频 + active speaker 切换）✅
 - `4b84d56 feat(sdk): add Room::Disconnect() for synchronous server-side leave`
 - `f4c2b7a feat(port): Phase 8.4.4-完整 — daemon mode with per-meeting FFI lifecycle`
 
+### 8.4.2-完整 — Hold-down + render-only switch（done 2026-04-29）
+
+**起点**：8.4.2-MVP 一观察到新 active speaker 立即 commit（sub new + unsub
+old）。手机+Web 同时讲话压测时崩 —— `corrupted double-linked list` SIGABRT，
+backtrace 整条都在 liblivekit_ffi.so 内 realloc 路径，是 SDK Rust 侧 race。
+
+**诊断**：先加 `crashHandler`（SIGSEGV/SIGBUS/SIGABRT）+ `-rdynamic` 让符号
+解析到。第一次复现拿到 SIGABRT signal=6 + 整条 FFI 内部栈帧确认 SDK bug。
+hold-down 600ms 试着减低 churn 频率，崩溃间隔从"切几次就崩"延长到~30s 一次但
+还崩 → 说明不是频率问题，**每次 setSubscribed(false) 都让 FFI 累积 heap 损坏**。
+
+**修法（双层）**：
+
+1. **600ms hold-down**：candidate 必须连续观察 ≥600ms 才 commit。
+   - MeetingController 状态机分两步：`observeActiveSpeaker`（仅记录 pending）+
+     `tryCommitPendingActive`（worker 醒来时检查 pending 是否过期）
+   - workerLoop 用 `cv.wait_until(deadline)` 挂 hold-down 截止时间
+   - 同 candidate 重复观察不重置计时；不同 candidate 触发计时重置
+   - tunable via `BOARD_ACTIVE_SPEAKER_HOLDDOWN_MS`
+
+2. **Render-only switch**：commit 不再 `setSubscribed(false)`。所有远端视频
+   stay-subscribed，`commitActiveSpeakerSwitch` 只切 `g_video_router.setActive`
+   （atomic，不进 FFI）。`handleTrackPublishedDefend` 也 gut 成 no-op（同样
+   会触发 FFI bug）。
+   - 代价：N peer 全 stay-subscribed，每个 peer 一路 HW 解码
+   - 实测 2-3 peer 无压力（MPP HW codec）
+   - **10-peer 极限场景 deferred 到 SDK FFI bug 修复后再优化**
+
+**为什么不 push fix 给 SDK**：bug 在 Rust 侧 unsubscribe 路径的 realloc。修
+需要拿到 client-sdk-rust trace + 复现 minimal repro，跑上游沟通流程，工作量
+远超本阶段。当前 workaround 不需要任何 unsub 也能跑会议，做完更紧迫的产品
+级 subphase 再回头修。
+
+**实测验证 2026-04-29**：手机+Web 同时讲话 3+ 分钟，多次 hold-down 间隔的
+切换全部走 render-only 路径，零崩，零 FFI 警告。
+
+**Commit**：`6437239 feat(port): Phase 8.4.2-完整 — hold-down + render-only active speaker switch`
+
 ### 8.4 后续 subphase
 
-**MVP + 8.4.4-完整 已完成 ✅**。剩下：
-
-下一步 **8.4.5**（OSD-on-video 触控 UI）或 **8.4.2-完整**（hold-down + 切换
-体验）— 看产品优先级。详见上面表格 + [计划文件](../../../../../../Users/19146/.claude/plans/wobbly-forging-moler.md)。
+**MVP + 8.4.2-完整 + 8.4.4-完整 已完成 ✅**。剩下 **8.4.5**（触控 UI）+
+**8.4.6**（多人 4h soak）。看产品优先级排。详见上面表格 + [计划文件](../../../../../../Users/19146/.claude/plans/wobbly-forging-moler.md)。
 
 ## 已知未做项 / 边界
 
 | 项 | 现状 | 影响 / 备注 |
 |---|---|---|
 | **MPP shutdown leaked group/buffer** | 未修，2026-04-28 8.2 soak 退出时观察到 | smoke.log 末尾打印 `mpp_buffer_service_deinit cleaning leaked group` + `cleaning leaked buffer`。**不影响运行**（7505s 0 underrun 0 ERROR），但说明 MPP buffer 内部 ref-count 有边角情况（可能跟 7.6.a `MppNV12Buffer` 的 inc_ref/put 配对有关）。短期容忍；如果未来观察到长跑后期 buffer pool 实际耗尽 / 性能退化再追。Phase 6.2 "clean shutdown" 工作没覆盖到 MPP 内部清理。|
+| **liblivekit_ffi heap corruption on remote video unsubscribe** | 已用 8.4.2-完整 render-only switch 绕过；上游待修 | 2026-04-29 用 crashHandler + glibc abort 抓到：每次 `setSubscribed(false)` 给远端 video track 都让 FFI 累积 heap damage，~3-5 次后 realloc 报 `corrupted double-linked list` SIGABRT。整条栈在 liblivekit_ffi.so 内。当前所有 peer video stay-subscribed，10 peer 极限场景 deferred；真做大规模会议前需修上游或换 simulcast layer 选层 API。|
 | 多 peer 加入崩溃 | 8.5 待修 | 详见 8.5 段 |
 | 7.6.c DRM dma-buf 直渲 | 等 1080P30 真要时再做 | 详见 8.3 |
 | 板上麦克风物理隔离 | 未做 | 8.1 已用 DAC 压低代偿；机械改造是更彻底但成本高的路线 |

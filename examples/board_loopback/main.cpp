@@ -122,7 +122,9 @@ constexpr double kAudioAmplitude = 6000.0; // ~ -15 dBFS, 不刺耳
 constexpr int kReportEverySeconds = 5;
 
 static std::atomic<bool> g_running{true};
-static void handleSignal(int) { g_running.store(false); }
+// handleSignal 的实际定义在文件后面，等 g_meeting_state 完整声明之后。
+// 这里仅前向声明，让 std::signal 注册时找得到符号。
+static void handleSignal(int);
 
 static std::string getenvOrEmpty(const char *name) {
   const char *v = std::getenv(name);
@@ -1264,14 +1266,20 @@ static std::unique_ptr<MeetingController> g_meeting_controller;
 // flag → 主循环检查到后退出 → cleanup → 进程退出（MVP 一会议一进程）。
 class MeetingState {
 public:
-  enum class State { Idle, Joining, InMeeting, Leaving };
+  // Phase 8.4.4-完整：daemon 模式新增 Shutdown 状态。signal handler 投
+  // requestShutdown() 让 waitForJoinOrShutdown 返回 nullopt，外循环 break
+  // 退 daemon。/leave 只把 InMeeting → Leaving，回 Idle 等下一会。
+  enum class State { Idle, Joining, InMeeting, Leaving, Shutdown };
 
   // HTTP /join：成功返回 {true, ""}，失败返回 {false, "<err>"}
   std::pair<bool, std::string> requestJoin(std::string url,
                                             std::string token) {
     std::lock_guard<std::mutex> lk(mu_);
+    if (state_ == State::Shutdown) {
+      return {false, "daemon shutting down"};
+    }
     if (state_ != State::Idle) {
-      return {false, "not in idle state; only one meeting per process (MVP)"};
+      return {false, "already in/past meeting; wait for /leave then retry"};
     }
     if (url.empty() || token.empty()) {
       return {false, "url/token must be non-empty"};
@@ -1292,27 +1300,52 @@ public:
     return true;
   }
 
-  // main thread：阻塞直到 join 触发，返回 (url, token)
-  std::pair<std::string, std::string> waitForJoin() {
+  // signal handler 调：daemon 收到 SIGINT/SIGTERM 进 Shutdown，
+  // 唤醒等在 waitForJoinOrShutdown 的 main thread 让它 break 外循环。
+  void requestShutdown() {
+    std::lock_guard<std::mutex> lk(mu_);
+    state_ = State::Shutdown;
+    cv_.notify_all();
+  }
+
+  // main thread：阻塞直到 join 触发或 shutdown。返回 nullopt 表示
+  // 收到 shutdown 应退出 daemon 外循环。
+  std::optional<std::pair<std::string, std::string>>
+  waitForJoinOrShutdown() {
     std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [this] { return state_ == State::Joining; });
-    return {pending_url_, pending_token_};
+    cv_.wait(lk, [this] {
+      return state_ == State::Joining || state_ == State::Shutdown;
+    });
+    if (state_ == State::Shutdown)
+      return std::nullopt;
+    return std::make_pair(pending_url_, pending_token_);
   }
 
   // runMeeting() 接通 Room 后进 InMeeting 状态，记下 room_name 给 status
   void setInMeeting(const std::string &room_name, Room *room) {
     std::lock_guard<std::mutex> lk(mu_);
+    if (state_ == State::Shutdown)
+      return; // 在 shutdown 中就别再进 InMeeting 了
     state_ = State::InMeeting;
     room_name_ = room_name;
     room_for_status_.store(room, std::memory_order_release);
   }
 
-  // runMeeting() 退出时清理状态机和 room 指针
+  // 会议结束清状态。守护 Shutdown 态（防止外循环误以为还要继续）。
   void clearMeeting() {
     std::lock_guard<std::mutex> lk(mu_);
-    state_ = State::Idle; // MVP 单会议进程其实不会再用，留 Idle 语义干净
+    if (state_ != State::Shutdown) {
+      state_ = State::Idle;
+    }
     room_name_.clear();
+    pending_url_.clear();
+    pending_token_.clear();
     room_for_status_.store(nullptr, std::memory_order_release);
+  }
+
+  bool isShutdown() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return state_ == State::Shutdown;
   }
 
   struct Snapshot {
@@ -1339,6 +1372,9 @@ public:
       case State::Leaving:
         s.state = "leaving";
         break;
+      case State::Shutdown:
+        s.state = "shutdown";
+        break;
       }
       s.room_name = room_name_;
     }
@@ -1361,6 +1397,18 @@ private:
 };
 
 static MeetingState g_meeting_state;
+
+// Phase 8.4.4-完整: 现在 g_meeting_state 完全声明好，可以给 handleSignal
+// 提供真正的实现。daemon 模式下 SIGINT/SIGTERM 必须唤醒等在
+// waitForJoinOrShutdown 上的 main thread 才能让外循环 break 退进程。
+//
+// 注意：std::lock_guard + cv.notify 在 signal handler 严格说不 async-signal-
+// safe（pthread_mutex_lock 不在 POSIX async-safe 列表上）。实践中 mutex 持
+// 锁极短不死锁，但严格场景应换 self-pipe trick；留给后续改进。
+static void handleSignal(int) {
+  g_running.store(false);
+  g_meeting_state.requestShutdown();
+}
 
 // Minimal JSON helpers — Phase 8.4.4
 // ---------------------------------------------------------------
@@ -1754,6 +1802,48 @@ private:
   std::string local_identity_; // Phase 8.4.2: 给 onActiveSpeakersChanged 过滤
 };
 
+// Phase 8.4.4-完整: per-meeting FFI + APM 初始化。每次会议开始前调用，
+// 会议结束 livekit::shutdown 之后再下次会议会重新初始化。
+//
+// 为什么每会议重做：Room 析构是 fire-and-forget drop FFI handle，server 收到
+// disconnect 是异步 + 不保证下个会议开始前完成；上轮残余 RTP / subscription
+// thread / 帧 callback 会泄漏到下轮，导致手机端仍看到板子在旧会议中。完整
+// shutdown FFI 强制同步关连接 + 清子线程。代价：每会议多花 ~100-300ms 启动。
+static void setupFfiAndApm() {
+  livekit::initialize(LogLevel::Info, LogSink::kConsole);
+
+  // Phase 7.4 APM tuning 见 phase7-summary.md / phase8-summary.md 8.1
+  if (const char *e = std::getenv("BOARD_LOOPBACK_AEC");
+      e && std::string(e) == "1") {
+    AudioProcessingModule::Options opts;
+    opts.echo_cancellation = true;
+    opts.noise_suppression = true;
+    opts.high_pass_filter = true;
+    // AGC 继续关 — ES8389 硬件 PGA + 8× 软件 gain 已校准
+    opts.auto_gain_control = false;
+    g_apm = std::make_unique<AudioProcessingModule>(opts);
+    g_apm_delay_ms = 400;
+    if (const char *d = std::getenv("BOARD_LOOPBACK_AEC_DELAY_MS")) {
+      try {
+        g_apm_delay_ms = std::stoi(d);
+      } catch (...) { /* keep default */
+      }
+    }
+    g_apm->setStreamDelayMs(g_apm_delay_ms);
+    g_apm_ready.store(true);
+    std::cout << "[loopback] APM AEC enabled (echo_cancellation + "
+                 "noise_suppression + high_pass_filter), delay_ms="
+              << g_apm_delay_ms << "\n";
+  }
+}
+
+// 拆 FFI + APM。在 room.reset() 之后调，下次会议前 setupFfiAndApm 重建。
+static void teardownFfiAndApm() {
+  g_apm.reset();
+  g_apm_ready.store(false);
+  livekit::shutdown();
+}
+
 int main(int argc, char *argv[]) {
   std::signal(SIGINT, handleSignal);
 #ifdef SIGTERM
@@ -1775,49 +1865,15 @@ int main(int argc, char *argv[]) {
     } catch (...) { /* keep default */ }
   }
 
-  livekit::initialize(LogLevel::Info, LogSink::kConsole);
-
-  // Phase 7.4: opt-in standalone APM for echo cancellation. Active when
-  // BOARD_LOOPBACK_AEC=1; tuning via BOARD_LOOPBACK_AEC_DELAY_MS.
+  // Phase 8.4.4-完整: livekit::initialize + APM 创建移到 per-meeting 生命
+  // 周期里（每会议 init + shutdown），保证 server side 真收到 disconnect
+  // 信号——否则 Room 析构只是 fire-and-forget drop FFI handle，会议结束
+  // 后手机/server 仍认为板子在房间，下次 join 同 identity 会被 server 误
+  // 判为 reconnect。详见下面外循环里的 setupFfiAndApm() 调用。
   //
-  // Default = 400ms based on empirical scoring on the ATK-DLRV1126B with
-  // PulseAudio→ES8389 path:
-  //
-  //   100ms → 0/100 (no cancellation; AEC's hint is too far off the real
-  //                  acoustic round-trip for adaptive delay to lock)
-  //   200ms → 50/100 (echo reduced but always present)
-  //   300ms → 70/100 (occasional misses early in the call)
-  //   400ms → 90/100 ★ — best score, residual is only the AEC3
-  //                       convergence window (~first 5-10s)
-  //   500ms → 80/100 (back-slides — overshoots actual delay)
-  //
-  // The 400ms figure is much higher than typical handset values because
-  // this board's audio chain stacks: AlsaPlayer queue (~50-300ms) →
-  // PulseAudio (~50ms) → ES8389 buffer (~50ms) → speaker → room → mic
-  // → ALSA capture (~100ms). Override via BOARD_LOOPBACK_AEC_DELAY_MS
-  // for hardware variants with a different chain.
-  if (const char *e = std::getenv("BOARD_LOOPBACK_AEC");
-      e && std::string(e) == "1") {
-    AudioProcessingModule::Options opts;
-    opts.echo_cancellation = true;
-    opts.noise_suppression = true;
-    opts.high_pass_filter = true;
-    // Keep AGC off — our hardware ES8389 PGA + 8× software gain calibration
-    // already handles levels; AGC would attenuate it (the original
-    // "from-the-earpiece" regression).
-    opts.auto_gain_control = false;
-    g_apm = std::make_unique<AudioProcessingModule>(opts);
-    g_apm_delay_ms = 400;
-    if (const char *d = std::getenv("BOARD_LOOPBACK_AEC_DELAY_MS")) {
-      try {
-        g_apm_delay_ms = std::stoi(d);
-      } catch (...) { /* keep default */ }
-    }
-    g_apm->setStreamDelayMs(g_apm_delay_ms);
-    g_apm_ready.store(true);
-    std::cout << "[loopback] APM AEC enabled (echo_cancellation + noise_suppression"
-                 " + high_pass_filter), delay_ms=" << g_apm_delay_ms << "\n";
-  }
+  // APM tuning: BOARD_LOOPBACK_AEC=1 启用，BOARD_LOOPBACK_AEC_DELAY_MS 调
+  // stream delay。ATK-DLRV1126B PulseAudio→ES8389 实测最佳 400ms（详见
+  // Phase 7.4 / 8.1 sweep 结果，smoke.sh 默认 300ms）。
 
   // Try to take over the DRM device for direct video plane rendering.
   // Skip with BOARD_LOOPBACK_NO_DRM=1 if running headless or weston
@@ -1841,24 +1897,46 @@ int main(int argc, char *argv[]) {
   BoardHttpServer http_server(api_token, api_port);
   http_server.start();
 
-  std::string env_url = getenvOrEmpty("LIVEKIT_URL");
-  std::string env_token = getenvOrEmpty("LIVEKIT_TOKEN");
-  if (argc >= 3) {
-    env_url = argv[1];
-    env_token = argv[2];
+  // Phase 8.4.4-完整: daemon 外循环。每轮：
+  //   1. waitForJoinOrShutdown 阻塞等下一次 /join 或 SIGINT/SIGTERM
+  //   2. 收到 join → 跑会议体（在 do/while(false) 块作用域内，所有
+  //      per-meeting 资源声明在块内 → 块退栈时 RAII 清理）
+  //   3. clearMeeting 回 Idle，外循环继续
+  // 启动时 LIVEKIT_URL/TOKEN env 已设的话，先 fire 第一次 join request
+  // 实现"自动加入"（兼容老 smoke.sh / 测试脚本 / 一会议一进程模式）。
+  {
+    std::string env_url = getenvOrEmpty("LIVEKIT_URL");
+    std::string env_token = getenvOrEmpty("LIVEKIT_TOKEN");
+    if (argc >= 3) {
+      env_url = argv[1];
+      env_token = argv[2];
+    }
+    if (!env_url.empty() && !env_token.empty()) {
+      std::cout << "[loopback] LIVEKIT_URL/TOKEN provided, auto-firing first "
+                   "join (skip HTTP wait)\n";
+      g_meeting_state.requestJoin(env_url, env_token);
+    }
   }
-  if (!env_url.empty() && !env_token.empty()) {
-    std::cout << "[loopback] LIVEKIT_URL/TOKEN provided, auto-firing join "
-                 "(skip HTTP wait)\n";
-    g_meeting_state.requestJoin(env_url, env_token);
-  } else {
-    std::cout << "[loopback] waiting for HTTP /v1/meeting/join "
-                 "(POST to 0.0.0.0:" << api_port
-              << " with Bearer auth)...\n";
-  }
-  auto [url, token] = g_meeting_state.waitForJoin();
-  std::cout << "[loopback] join received, connecting to '" << url << "'\n";
 
+  while (true) {
+    if (g_meeting_state.isShutdown())
+      break;
+    std::cout << "[daemon] waiting for HTTP /v1/meeting/join "
+                 "(POST to 0.0.0.0:"
+              << api_port << " with Bearer auth) or SIGINT/SIGTERM...\n";
+    auto join_or = g_meeting_state.waitForJoinOrShutdown();
+    if (!join_or) {
+      std::cout << "[daemon] shutdown requested, exiting outer loop\n";
+      break;
+    }
+    auto [url, token] = *join_or;
+    std::cout << "[loopback] join received, connecting to '" << url << "'\n";
+    g_running.store(true);
+
+  // Phase 8.4.4-完整: 每会议 init FFI + APM（保证上轮残余完全 tear down）
+  setupFfiAndApm();
+
+  // === 会议体起点：以下所有 per-meeting 变量都在外循环这一轮的栈帧上 ===
   auto room = std::make_unique<Room>();
   LoopbackDelegate delegate;
   room->setDelegate(&delegate);
@@ -1867,9 +1945,11 @@ int main(int argc, char *argv[]) {
   options.auto_subscribe = true;
   options.dynacast = false;
   if (!room->Connect(url, token, options)) {
-    std::cerr << "[loopback] failed to connect\n";
-    livekit::shutdown();
-    return 1;
+    std::cerr << "[loopback] failed to connect, returning to idle\n";
+    room.reset();
+    teardownFfiAndApm(); // 失败也要拆 FFI，下次 setupFfiAndApm 才有干净状态
+    g_meeting_state.clearMeeting();
+    continue; // 不退 daemon，回外循环等下次 /join
   }
 
   LocalParticipant *lp = room->localParticipant();
@@ -2205,15 +2285,31 @@ int main(int argc, char *argv[]) {
   // Phase 8.4.4: 先清掉 MeetingState 的 Room 指针（否则 status endpoint
   // 拿到悬垂指针），然后再 reset Room。
   g_meeting_state.clearMeeting();
-  // Drop tracks first, then room
+  // Drop tracks first
   audio_track.reset();
   audio_source.reset();
   video_track.reset();
+  // Phase 8.4.4-完整: 显式断开 Room（送 DisconnectRequest 到 FFI）
+  // 让 server 立刻 LEAVE 房间，对端立刻看到我们离开 —— 不再等 ~30s
+  // 客户端超时。Room::Disconnect 阻塞等 FFI 回调，正常 < 200ms。
+  if (room) {
+    room->Disconnect();
+  }
   room.reset();
-  // Phase 8.4.4: 停 HTTP server（join 它的 listen thread）。放在 Room reset
-  // 之后，避免新 join request 进来访问已销毁的状态机。
+  // 然后 tear-down FFI 整个 runtime，下次 setupFfiAndApm 重建。
+  teardownFfiAndApm();
+  // === 会议体终点：所有 per-meeting 资源 RAII + FFI 都拆完了 ===
+  std::cout << "[daemon] meeting cleaned up; idle, waiting for next /join "
+               "or signal\n";
+  } // ← 外循环 while(true) 的尾巴
+
+  // Phase 8.4.4-完整: 进程级清理（外循环退出后才走到这里）。
+  // 注意：此时 livekit FFI 已经被上一轮 teardownFfiAndApm 清掉了（如果
+  // 跑过至少一次会议），所以这里不再 livekit::shutdown。HTTP server 还
+  // 活着，最后停掉。
+  std::cout << "[daemon] outer loop exited, shutting down process-level "
+               "resources\n";
   http_server.stop();
-  livekit::shutdown();
 
   std::cout << "[loopback] done.\n";
   return 0;

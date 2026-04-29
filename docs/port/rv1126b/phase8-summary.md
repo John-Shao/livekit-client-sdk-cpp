@@ -148,7 +148,7 @@ Phase 7 文档"~58%"是 270s 短测，那时 codec/AEC/MPP buffer pool 都没真
 | **8.4.1** | DrmDisplay 多 callback 安全 + VideoRouter（fix 多 peer crash）| ✅ 完成 2026-04-29 |
 | **8.4.2-MVP** | onActiveSpeakersChanged + MeetingController + 动态 setSubscribed | ✅ 完成 2026-04-29 |
 | **8.4.3** | 音频软混音器（pull 模型 + AEC reverse on mix）| ✅ 完成 2026-04-29 |
-| 8.4.4-MVP | HTTP API 极简版 + Bearer auth | ⏳ 下一步 |
+| **8.4.4-MVP** | HTTP API 极简版 + Bearer auth | ✅ 完成 2026-04-29 |
 | 8.4.2-完整 | hold-down 600ms + 切换体验优化 | ⏳ |
 | 8.4.4-完整 | Daemon 化 + 完整 lifecycle | ⏳ |
 | 8.4.5 | 触控 UI（OSD-on-video MVP） | ⏳ |
@@ -266,11 +266,91 @@ alsa_underruns=0；AEC 不退化；视频切换 + active speaker 仍正常（8.4
 
 **Commit**：`2516958 feat(port): Phase 8.4.3 — multi-peer audio software mixer + AEC reverse on mix`
 
+### 8.4.4-MVP — HTTP API + Bearer auth（done 2026-04-29）
+
+**目标**：板子开 HTTP API 让后端 push 会议 token 触发加房；GET /status 给
+运维看进程当前态。MVP 单会议进程（一次 leave 退一次进程）；完整 daemon 留
+8.4.4-完整。
+
+**实施**：
+
+1. vendor cpp-httplib v0.43.1 单头文件到 [third_party/httplib.h](../../../third_party/httplib.h)
+   （header-only，从 https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/httplib.h 下载，MIT 协议）。
+2. **避开 nlohmann_json 依赖**：手写 ~80 行 `mini_json::{parseString, getString,
+   escape}`。理由：Buildroot 不带，FetchContent 在中国大陆 GitHub 网络又卡，
+   而我们的 JSON 用例只有"取 url+token"和"产几行 KV"，不值得引依赖。
+3. 新增 `class MeetingState g_meeting_state`（进程级会议生命周期）：
+   - state ∈ {Idle, Joining, InMeeting, Leaving}
+   - `requestJoin(url, token)` HTTP /join 投递 cmd → main thread waitForJoin 解出
+   - `requestLeave()` HTTP /leave → 触发 g_running.store(false) 让主循环退出
+   - `setInMeeting(room_name, room*)` runMeeting 接通 Room 后调，给 status 用
+   - `snapshot()` 给 GET /status 返回当前态 + room_name + active_speaker (从
+     g_meeting_controller 拿) + participant_count (从 Room 拿)
+4. 新增 `class BoardHttpServer`（cpp-httplib 包装）：
+   - listener thread on `0.0.0.0:$BOARD_API_PORT`（默认 8080）
+   - 3 端点：POST /v1/meeting/join、POST /v1/meeting/leave、GET /v1/meeting/status
+   - **Bearer auth**：env `BOARD_API_TOKEN` 必填，未设直接 startup error 退出。
+     POST 必带 `Authorization: Bearer <token>`，匹配失败返 401。GET /status 不
+     验 auth（运维诊断用）。
+5. main() 重构：
+   - BOARD_API_TOKEN 必填检查
+   - 启 HTTP server
+   - waitForJoin 阻塞 → 拿 (url, token) 进 Connect
+   - **向后兼容**：启动时 LIVEKIT_URL/TOKEN env（或 argv）已设 → 内部 fire 一次
+     join request，自动加入（兼容 smoke.sh 老用法 + 单元测试）
+   - leave 后进程退出（MVP 单会议）
+6. cleanup 顺序：audio_thread join → MeetingController reset → MeetingState
+   clearMeeting（清掉 Room 指针避免悬垂）→ tracks/source reset → Room reset →
+   http_server.stop（最后停 server，避免新 join 进来访问已销毁状态机）
+7. smoke.sh 加 BOARD_API_TOKEN（dev 默认 `board-dev-token-change-in-prod`）+
+   BOARD_API_PORT（默认 8080）+ 状态行多一行 api endpoint 提示。
+
+**端点契约**:
+
+```
+POST /v1/meeting/join
+  Headers: Authorization: Bearer <BOARD_API_TOKEN>
+  Body:    {"url":"wss://...","token":"<JWT>"}
+  → 202 {"status":"joining"}    成功投递
+  → 400                           bad json
+  → 401                           bearer 错
+  → 409                           已在会议中（MVP 单会议）
+
+POST /v1/meeting/leave
+  Headers: Authorization: Bearer <BOARD_API_TOKEN>
+  → 200 {"status":"leaving"}    会触发主循环退出 + 进程退出
+  → 401                           bearer 错
+  → 409                           不在会议状态
+
+GET /v1/meeting/status
+  → 200 {"state":"...","room_name":"...","active_speaker":"...","participant_count":N}
+  state ∈ {idle, joining, in_meeting, leaving}
+```
+
+**实测验证 2026-04-29**:
+
+```
+$ curl -s http://localhost:8080/v1/meeting/status
+{"state":"in_meeting","room_name":"f1d641ae-...","active_speaker":"","participant_count":0} ✅
+
+$ curl -s -X POST http://localhost:8080/v1/meeting/leave
+{"error":"unauthorized: missing or invalid bearer"}  HTTP 401 ✅
+
+$ curl -s -X POST -H "Authorization: Bearer <token>" http://localhost:8080/v1/meeting/leave
+{"status":"leaving"}  HTTP 200 ✅ → 板子真退会 + 进程退出
+```
+
+**未做（留 8.4.4-完整）**：daemon 化 + 跨会议持有 V4L2/ALSA/APM/MppEncoder，
+当前一次 leave 退一次进程，下次 join 重启资源。
+
+**Commit**：`5dad383 feat(port): Phase 8.4.4-MVP — HTTP API + Bearer auth for meeting join/leave`
+
 ### 8.4 后续 subphase
 
-下一步 **8.4.4-MVP**：HTTP API + Bearer auth（cpp-httplib 单文件，启动 listener
-on `0.0.0.0:8080`，端点 `POST /v1/meeting/join`、`POST /v1/meeting/leave`、
-`GET /v1/meeting/status`）。详见上面表格 + 计划文件。
+**MVP（8.4.1+8.4.2-MVP+8.4.3+8.4.4-MVP）已完成 ✅**。剩下增量做产品级：
+
+下一步 **8.4.5**（OSD-on-video 触控 UI）或 **8.4.4-完整**（daemon 化）—
+看产品优先级。详见上面表格 + [计划文件](../../../../../../Users/19146/.claude/plans/wobbly-forging-moler.md)。
 
 ## 已知未做项 / 边界
 

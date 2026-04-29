@@ -318,7 +318,10 @@ add_executable(BoardLoopback
   board_loopback/main.cpp
 )
 
-target_include_directories(BoardLoopback PRIVATE ${EXAMPLES_PRIVATE_INCLUDE_DIRS})
+target_include_directories(BoardLoopback PRIVATE
+  ${EXAMPLES_PRIVATE_INCLUDE_DIRS}
+  ${LIVEKIT_ROOT_DIR}/third_party  # Phase 8.4.4: cpp-httplib (header-only)
+)
 
 # ALSA for ES8389 codec playback + libdrm for KMS plane rendering. Linked
 # unconditionally since this example is only useful on Linux; sysroot must

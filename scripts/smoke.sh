@@ -74,6 +74,11 @@ AEC_DELAY_MS=300
 TOKEN=""
 BG=0
 LOG=/tmp/smoke.log
+# Phase 8.4.4: BoardLoopback 现在默认起 HTTP API 在 0.0.0.0:8080，所有 POST
+# 必须带 Authorization: Bearer <token>。如果用户没 export BOARD_API_TOKEN，
+# 这里给一个 dev-mode 默认值方便板上自测；生产部署一定要改成强随机串。
+BOARD_API_TOKEN="${BOARD_API_TOKEN:-board-dev-token-change-in-prod}"
+BOARD_API_PORT="${BOARD_API_PORT:-8080}"
 
 # ---- 参数解析 ----
 while [ $# -gt 0 ]; do
@@ -156,6 +161,8 @@ if [ "$USE_MPP" = "1" ]; then
 else
   unset BOARD_LOOPBACK_USE_MPP
 fi
+export BOARD_API_TOKEN="$BOARD_API_TOKEN"
+export BOARD_API_PORT="$BOARD_API_PORT"
 
 # ---- run ----
 echo "==== smoke ===="
@@ -167,6 +174,7 @@ echo "  fit      = $FIT (fill=crop center / fit=letterbox / stretch=historic)"
 echo "  use_mpp  = $USE_MPP"
 echo "  aec      = $AEC (delay=${AEC_DELAY_MS}ms; livekit::AudioProcessingModule AEC3+NS+HPF)"
 echo "  dac      = $DAC (ES8389 numid=48/49; 155=-18dB default / 191=0dB ref)"
+echo "  api      = http://0.0.0.0:$BOARD_API_PORT (Bearer auth required for POST)"
 echo "  bg       = $BG"
 echo "  log      = $LOG (only when --bg)"
 echo "==============="

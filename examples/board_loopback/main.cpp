@@ -17,6 +17,12 @@
  * whatever the token's `sub` claim says.
  */
 
+// Phase 8.4.4: HTTP API server (cpp-httplib header-only)。我们的 JSON 用例
+// 仅 4 个：解析 join body 取 url+token、生成 status 响应、生成 join
+// response、错误响应。手写 30 行 minimal helper 避免 nlohmann_json 依赖
+// （Buildroot 不带，FetchContent 又卡 GitHub），BoardLoopback 二进制更瘦。
+#include <httplib.h>
+
 #include "livekit/audio_frame.h"
 #include "livekit/audio_processing_module.h"
 #include "livekit/audio_source.h"
@@ -63,6 +69,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -70,6 +77,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1248,6 +1256,361 @@ private:
 
 static std::unique_ptr<MeetingController> g_meeting_controller;
 
+// MeetingState — Phase 8.4.4
+// ---------------------------------------------------------------
+// 进程级会议生命周期状态机 + HTTP join 命令 inbox。HTTP /v1/meeting/join
+// 把 (url, token) 投到这里 → main thread 在 waitForJoin 上 cv 等到后
+// 取出参数进入 runMeeting()。HTTP /v1/meeting/leave 触发 leaveRequested
+// flag → 主循环检查到后退出 → cleanup → 进程退出（MVP 一会议一进程）。
+class MeetingState {
+public:
+  enum class State { Idle, Joining, InMeeting, Leaving };
+
+  // HTTP /join：成功返回 {true, ""}，失败返回 {false, "<err>"}
+  std::pair<bool, std::string> requestJoin(std::string url,
+                                            std::string token) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (state_ != State::Idle) {
+      return {false, "not in idle state; only one meeting per process (MVP)"};
+    }
+    if (url.empty() || token.empty()) {
+      return {false, "url/token must be non-empty"};
+    }
+    pending_url_ = std::move(url);
+    pending_token_ = std::move(token);
+    state_ = State::Joining;
+    cv_.notify_all();
+    return {true, ""};
+  }
+
+  // HTTP /leave：成功返回 true，状态不对返回 false
+  bool requestLeave() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (state_ != State::InMeeting)
+      return false;
+    state_ = State::Leaving;
+    return true;
+  }
+
+  // main thread：阻塞直到 join 触发，返回 (url, token)
+  std::pair<std::string, std::string> waitForJoin() {
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [this] { return state_ == State::Joining; });
+    return {pending_url_, pending_token_};
+  }
+
+  // runMeeting() 接通 Room 后进 InMeeting 状态，记下 room_name 给 status
+  void setInMeeting(const std::string &room_name, Room *room) {
+    std::lock_guard<std::mutex> lk(mu_);
+    state_ = State::InMeeting;
+    room_name_ = room_name;
+    room_for_status_.store(room, std::memory_order_release);
+  }
+
+  // runMeeting() 退出时清理状态机和 room 指针
+  void clearMeeting() {
+    std::lock_guard<std::mutex> lk(mu_);
+    state_ = State::Idle; // MVP 单会议进程其实不会再用，留 Idle 语义干净
+    room_name_.clear();
+    room_for_status_.store(nullptr, std::memory_order_release);
+  }
+
+  struct Snapshot {
+    std::string state;
+    std::string room_name;
+    std::string active_speaker;
+    int participant_count = 0;
+  };
+
+  Snapshot snapshot() const {
+    Snapshot s;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      switch (state_) {
+      case State::Idle:
+        s.state = "idle";
+        break;
+      case State::Joining:
+        s.state = "joining";
+        break;
+      case State::InMeeting:
+        s.state = "in_meeting";
+        break;
+      case State::Leaving:
+        s.state = "leaving";
+        break;
+      }
+      s.room_name = room_name_;
+    }
+    if (g_meeting_controller)
+      s.active_speaker = g_meeting_controller->currentActive();
+    if (auto *room = room_for_status_.load(std::memory_order_acquire))
+      s.participant_count =
+          static_cast<int>(room->remoteParticipants().size());
+    return s;
+  }
+
+private:
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  State state_ = State::Idle;
+  std::string pending_url_;
+  std::string pending_token_;
+  std::string room_name_;
+  std::atomic<Room *> room_for_status_{nullptr};
+};
+
+static MeetingState g_meeting_state;
+
+// Minimal JSON helpers — Phase 8.4.4
+// ---------------------------------------------------------------
+// 我们对 JSON 的需求极小：解析 `{"url":"...","token":"..."}` 取两个字符串
+// 字段，生成 `{"key":"value", ...}` 几个字段的响应。引一个 nlohmann_json
+// 仅为这点用例不值得（Buildroot 不带，FetchContent 网络又卡），手写。
+namespace mini_json {
+
+// 字符串 escape：双引号、反斜杠、控制字符。够生产 token / url / identity
+// 这些 ASCII 友好场景；不处理 \uXXXX。
+inline std::string escape(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 4);
+  for (char c : s) {
+    switch (c) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\b':
+      out += "\\b";
+      break;
+    case '\f':
+      out += "\\f";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    default:
+      if (static_cast<unsigned char>(c) < 0x20) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+        out += buf;
+      } else {
+        out += c;
+      }
+    }
+  }
+  return out;
+}
+
+// 解析 JSON 字符串：从 `s` 第 `pos` 位（指向开 `"`）开始，返回 (value, end_pos)。
+// 失败抛 runtime_error。
+inline std::pair<std::string, std::size_t> parseString(const std::string &s,
+                                                       std::size_t pos) {
+  if (pos >= s.size() || s[pos] != '"')
+    throw std::runtime_error("expected '\"' at offset " + std::to_string(pos));
+  std::string out;
+  ++pos;
+  while (pos < s.size()) {
+    char c = s[pos];
+    if (c == '"')
+      return {out, pos + 1};
+    if (c == '\\' && pos + 1 < s.size()) {
+      char e = s[pos + 1];
+      switch (e) {
+      case '"':
+        out += '"';
+        break;
+      case '\\':
+        out += '\\';
+        break;
+      case '/':
+        out += '/';
+        break;
+      case 'b':
+        out += '\b';
+        break;
+      case 'f':
+        out += '\f';
+        break;
+      case 'n':
+        out += '\n';
+        break;
+      case 'r':
+        out += '\r';
+        break;
+      case 't':
+        out += '\t';
+        break;
+      default:
+        // 不支持 \uXXXX；token / url 不会用
+        throw std::runtime_error("unsupported escape \\" + std::string(1, e));
+      }
+      pos += 2;
+    } else {
+      out += c;
+      ++pos;
+    }
+  }
+  throw std::runtime_error("unterminated string");
+}
+
+// 在简单 flat object `{"k1":"v1","k2":"v2"}` 里取 key 的字符串值。
+// 不支持嵌套 / 数组 / 数字 —— 我们的 schema 是 (url, token) 两字符串字段，够用。
+// 找不到 key 返回空 optional。
+inline std::optional<std::string> getString(const std::string &json,
+                                             const std::string &key) {
+  // 找 `"key"` 子串
+  const std::string needle = "\"" + key + "\"";
+  std::size_t pos = json.find(needle);
+  if (pos == std::string::npos)
+    return std::nullopt;
+  pos += needle.size();
+  // skip whitespace + ':' + whitespace
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])))
+    ++pos;
+  if (pos >= json.size() || json[pos] != ':')
+    return std::nullopt;
+  ++pos;
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos])))
+    ++pos;
+  try {
+    auto [val, _] = parseString(json, pos);
+    return val;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+} // namespace mini_json
+
+// BoardHttpServer — Phase 8.4.4
+// ---------------------------------------------------------------
+// cpp-httplib 包装。listen_thread_ 跑 server.listen 阻塞；server.stop()
+// 让它返回，然后 join。所有 POST 必须带 Authorization: Bearer <BOARD_API_TOKEN>，
+// GET /status 不要 auth（运维诊断用）。端点：
+//   POST /v1/meeting/join  body {"url":"wss://...","token":"<jwt>"} → 202 / 401 / 409 / 400
+//   POST /v1/meeting/leave                                          → 200 / 401 / 409
+//   GET  /v1/meeting/status                                         → 200 (always)
+class BoardHttpServer {
+public:
+  BoardHttpServer(std::string bearer, int port)
+      : bearer_(std::move(bearer)), port_(port) {
+    setupRoutes();
+  }
+
+  void start() {
+    listen_thread_ = std::thread([this] {
+      std::cout << "[http] listening on 0.0.0.0:" << port_ << "\n";
+      // listen 阻塞直到 server.stop()
+      if (!server_.listen("0.0.0.0", port_)) {
+        std::cerr << "[http] listen on 0.0.0.0:" << port_ << " failed\n";
+      }
+    });
+    // 等 server 进入 listen 循环再返回（avoid race in tests）
+    int waited_ms = 0;
+    while (!server_.is_running() && waited_ms < 2000) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      waited_ms += 20;
+    }
+  }
+
+  void stop() {
+    server_.stop();
+    if (listen_thread_.joinable())
+      listen_thread_.join();
+  }
+
+private:
+  bool checkBearer(const httplib::Request &req) const {
+    auto it = req.headers.find("Authorization");
+    if (it == req.headers.end())
+      return false;
+    const std::string expected = "Bearer " + bearer_;
+    return it->second == expected;
+  }
+
+  static void reject401(httplib::Response &res) {
+    res.status = 401;
+    res.set_content(R"({"error":"unauthorized: missing or invalid bearer"})",
+                    "application/json");
+  }
+
+  void setupRoutes() {
+    server_.Post("/v1/meeting/join", [this](const httplib::Request &req,
+                                            httplib::Response &res) {
+      if (!checkBearer(req)) {
+        reject401(res);
+        return;
+      }
+      auto url_opt = mini_json::getString(req.body, "url");
+      auto token_opt = mini_json::getString(req.body, "token");
+      if (!url_opt || !token_opt) {
+        res.status = 400;
+        res.set_content(
+            R"({"error":"bad json: expected {\"url\":\"...\",\"token\":\"...\"}"})",
+            "application/json");
+        return;
+      }
+      auto [ok, err] = g_meeting_state.requestJoin(std::move(*url_opt),
+                                                    std::move(*token_opt));
+      if (ok) {
+        res.status = 202;
+        res.set_content(R"({"status":"joining"})", "application/json");
+      } else {
+        res.status = 409;
+        std::string body = R"({"error":")" + mini_json::escape(err) + "\"}";
+        res.set_content(body, "application/json");
+      }
+    });
+
+    server_.Post("/v1/meeting/leave", [this](const httplib::Request &req,
+                                             httplib::Response &res) {
+      if (!checkBearer(req)) {
+        reject401(res);
+        return;
+      }
+      if (g_meeting_state.requestLeave()) {
+        // 让 main loop 退出（runMeeting 检查 g_running）
+        g_running.store(false);
+        res.status = 200;
+        res.set_content(R"({"status":"leaving"})", "application/json");
+      } else {
+        res.status = 409;
+        res.set_content(R"({"error":"not in meeting"})", "application/json");
+      }
+    });
+
+    server_.Get("/v1/meeting/status",
+                [](const httplib::Request &, httplib::Response &res) {
+                  auto snap = g_meeting_state.snapshot();
+                  std::string body = "{";
+                  body += "\"state\":\"" + mini_json::escape(snap.state) + "\",";
+                  body += "\"room_name\":\"" +
+                          mini_json::escape(snap.room_name) + "\",";
+                  body += "\"active_speaker\":\"" +
+                          mini_json::escape(snap.active_speaker) + "\",";
+                  body += "\"participant_count\":" +
+                          std::to_string(snap.participant_count);
+                  body += "}";
+                  res.status = 200;
+                  res.set_content(body, "application/json");
+                });
+  }
+
+  httplib::Server server_;
+  std::string bearer_;
+  int port_;
+  std::thread listen_thread_;
+};
+
 class LoopbackDelegate : public RoomDelegate {
 public:
   void onParticipantConnected(Room &,
@@ -1392,22 +1755,25 @@ private:
 };
 
 int main(int argc, char *argv[]) {
-  std::string url = getenvOrEmpty("LIVEKIT_URL");
-  std::string token = getenvOrEmpty("LIVEKIT_TOKEN");
-  if (argc >= 3) {
-    url = argv[1];
-    token = argv[2];
-  }
-  if (url.empty() || token.empty()) {
-    std::cerr << "Usage: BoardLoopback <ws-url> <token>\n"
-              << "   or  LIVEKIT_URL=... LIVEKIT_TOKEN=... BoardLoopback\n";
-    return 1;
-  }
-
   std::signal(SIGINT, handleSignal);
 #ifdef SIGTERM
   std::signal(SIGTERM, handleSignal);
 #endif
+
+  // Phase 8.4.4: BOARD_API_TOKEN 是 HTTP API 的 Bearer，必填（生产防同
+  // LAN 误拽）。MVP 不用 dev-mode 后门，未设直接退。
+  std::string api_token = getenvOrEmpty("BOARD_API_TOKEN");
+  if (api_token.empty()) {
+    std::cerr << "ERROR: BOARD_API_TOKEN env not set; required for HTTP API "
+                 "Bearer auth. Set a non-empty secret and retry.\n";
+    return 1;
+  }
+  int api_port = 8080;
+  if (const char *p = std::getenv("BOARD_API_PORT")) {
+    try {
+      api_port = std::stoi(p);
+    } catch (...) { /* keep default */ }
+  }
 
   livekit::initialize(LogLevel::Info, LogSink::kConsole);
 
@@ -1468,6 +1834,31 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // Phase 8.4.4: 起 HTTP API server，等 /v1/meeting/join 把 (url, token)
+  // 投到 MeetingState 后再继续。如果启动时已有 LIVEKIT_URL/LIVEKIT_TOKEN
+  // env 或 argv，内部 fire 一次 join request 实现"自动加入"（兼容老的
+  // smoke.sh + 测试脚本，不强迫用户必须用 curl 才能开会）。
+  BoardHttpServer http_server(api_token, api_port);
+  http_server.start();
+
+  std::string env_url = getenvOrEmpty("LIVEKIT_URL");
+  std::string env_token = getenvOrEmpty("LIVEKIT_TOKEN");
+  if (argc >= 3) {
+    env_url = argv[1];
+    env_token = argv[2];
+  }
+  if (!env_url.empty() && !env_token.empty()) {
+    std::cout << "[loopback] LIVEKIT_URL/TOKEN provided, auto-firing join "
+                 "(skip HTTP wait)\n";
+    g_meeting_state.requestJoin(env_url, env_token);
+  } else {
+    std::cout << "[loopback] waiting for HTTP /v1/meeting/join "
+                 "(POST to 0.0.0.0:" << api_port
+              << " with Bearer auth)...\n";
+  }
+  auto [url, token] = g_meeting_state.waitForJoin();
+  std::cout << "[loopback] join received, connecting to '" << url << "'\n";
+
   auto room = std::make_unique<Room>();
   LoopbackDelegate delegate;
   room->setDelegate(&delegate);
@@ -1484,6 +1875,10 @@ int main(int argc, char *argv[]) {
   LocalParticipant *lp = room->localParticipant();
   std::cout << "[loopback] connected as identity='" << lp->identity()
             << "' room='" << room->room_info().name << "'\n";
+
+  // Phase 8.4.4: 状态切到 InMeeting，让 GET /status 能 report room_name +
+  // 通过 Room 指针拿 participant_count。
+  g_meeting_state.setInMeeting(room->room_info().name, room.get());
 
   // Phase 8.4.2: 起 MeetingController，将 SDK delegate 投来的 active
   // speaker / track published 事件串行 reconcile（避免多 delegate 线程
@@ -1807,11 +2202,17 @@ int main(int argc, char *argv[]) {
   // Phase 8.4.2: 先停 controller worker（避免 worker 在 room 已 reset 后
   // 还尝试访问 remoteParticipant）。它 dtor 会发 Shutdown cmd + join。
   g_meeting_controller.reset();
+  // Phase 8.4.4: 先清掉 MeetingState 的 Room 指针（否则 status endpoint
+  // 拿到悬垂指针），然后再 reset Room。
+  g_meeting_state.clearMeeting();
   // Drop tracks first, then room
   audio_track.reset();
   audio_source.reset();
   video_track.reset();
   room.reset();
+  // Phase 8.4.4: 停 HTTP server（join 它的 listen thread）。放在 Room reset
+  // 之后，避免新 join request 进来访问已销毁的状态机。
+  http_server.stop();
   livekit::shutdown();
 
   std::cout << "[loopback] done.\n";

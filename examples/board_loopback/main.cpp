@@ -51,6 +51,7 @@
 
 #include <alsa/asoundlib.h>
 
+#include <execinfo.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -1090,18 +1091,25 @@ private:
 
 static VideoRouter g_video_router;
 
-// MeetingController — Phase 8.4.2-MVP
+// MeetingController — Phase 8.4.2 (MVP + 完整 hold-down)
 // ---------------------------------------------------------------
 // 单 worker thread + 命令队列，串行处理 active speaker 切换 + 视频订阅
 // 控制。所有 SDK delegate 事件都投递 Cmd 进队列，worker 串行 reconcile，
 // 避免多 delegate 线程并发改 setSubscribed / VideoRouter active 状态。
 //
-// MVP 行为（不带 hold-down 抗抖动，看到 SDK 抖多严重再决定加多长）：
-//   - onActiveSpeakersChanged → ActiveSpeakerObserved cmd
+// 行为：
+//   - onActiveSpeakersChanged → ActiveSpeakerObserved cmd（仅"观察"，不立即切）
 //   - onTrackPublished(VIDEO) → TrackPublishedDefend cmd（非 active 立即 unsub
 //     防 10 peer 全订阅解码爆 CPU）
-//   - 切换：new_active.video.setSubscribed(true) → router.setActive →
-//     old_active.video.setSubscribed(false)
+//   - 切换需要新 speaker 连续观察 ≥ kHoldDownMs 才 commit（默认 600ms，可通过
+//     BOARD_ACTIVE_SPEAKER_HOLDDOWN_MS 调）。worker 在 cv.wait_until 上挂 deadline，
+//     到点检查 pending 是否仍然有效，是的话 commit (sub new → router → unsub old)
+//
+// 为什么需要 hold-down（2026-04-29 实测）：
+// 手机 + Web 同时讲话时，SDK 的 onActiveSpeakersChanged 在两者间 < 500ms 反复
+// 抖动；MVP 直接切导致 sub/unsub 风暴 → 在 liblivekit_ffi 内部 malloc 报
+// "corrupted double-linked list" SIGABRT（FFI 侧 race，我们改不了）。600ms
+// 的 hold-down 足以让"同时讲话"自然收敛到稳定 speaker，避免高频 churn。
 class MeetingController {
 public:
   enum class CmdType {
@@ -1117,6 +1125,12 @@ public:
 
   MeetingController(Room *room, std::string local_identity)
       : room_(room), local_identity_(std::move(local_identity)) {
+    if (const char *e = std::getenv("BOARD_ACTIVE_SPEAKER_HOLDDOWN_MS")) {
+      try {
+        int ms = std::stoi(e);
+        if (ms >= 0 && ms < 60000) hold_down_ms_ = ms;
+      } catch (...) { /* keep default */ }
+    }
     worker_ = std::thread([this] { workerLoop(); });
   }
 
@@ -1141,44 +1155,108 @@ public:
   }
 
 private:
+  using Clock = std::chrono::steady_clock;
+
   void workerLoop() {
     while (true) {
       Cmd cmd;
+      bool got_cmd = false;
       {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [this] { return !queue_.empty(); });
-        cmd = std::move(queue_.front());
-        queue_.pop_front();
+        // 计算下一个 hold-down deadline；没 pending 就长睡到下次 enqueue
+        // notify。命令队列非空也立刻醒，正常 reconcile。
+        auto deadline = Clock::now() + std::chrono::hours(1);
+        {
+          std::lock_guard<std::mutex> sl(state_mu_);
+          if (!pending_active_.empty()) {
+            deadline = pending_first_seen_ +
+                       std::chrono::milliseconds(hold_down_ms_);
+          }
+        }
+        cv_.wait_until(lk, deadline, [this] { return !queue_.empty(); });
+        if (!queue_.empty()) {
+          cmd = std::move(queue_.front());
+          queue_.pop_front();
+          got_cmd = true;
+        }
       }
-      switch (cmd.type) {
-      case CmdType::Shutdown:
-        return;
-      case CmdType::ActiveSpeakerObserved:
-        handleActiveSpeaker(cmd.identity);
-        break;
-      case CmdType::TrackPublishedDefend:
-        handleTrackPublishedDefend(cmd.identity, cmd.sid);
-        break;
+      if (got_cmd) {
+        switch (cmd.type) {
+        case CmdType::Shutdown:
+          return;
+        case CmdType::ActiveSpeakerObserved:
+          observeActiveSpeaker(cmd.identity);
+          break;
+        case CmdType::TrackPublishedDefend:
+          handleTrackPublishedDefend(cmd.identity, cmd.sid);
+          break;
+        }
       }
+      // 不论是 cmd 处理完还是 deadline 到，都检查一次 pending 是否该 commit
+      tryCommitPendingActive();
     }
   }
 
-  // 切换 active：sub 新的 video，setActive，unsub 旧的。
-  void handleActiveSpeaker(const std::string &new_active) {
-    if (new_active.empty())
+  // observeActiveSpeaker：仅记录"观察到 X"，等 hold-down 到点再 commit。
+  // 同 X 重复观察刷新时间戳没意义（不重置 first_seen），不同 X 就把 pending
+  // 换成新 X，重置 first_seen 倒数。
+  void observeActiveSpeaker(const std::string &observed) {
+    if (observed.empty())
       return;
-    std::string old_active;
+    std::lock_guard<std::mutex> lk(state_mu_);
+    if (observed == current_active_) {
+      // 已经是 active，把 pending 清掉（防之前另一个 candidate 卡在 pending）
+      pending_active_.clear();
+      return;
+    }
+    if (observed == pending_active_) {
+      // 同一个候选仍在被观察 — 不重置 first_seen，让 hold-down 自然到期
+      return;
+    }
+    // 新候选 / candidate 切换 → 重置 hold-down 倒数
+    pending_active_ = observed;
+    pending_first_seen_ = Clock::now();
+  }
+
+  // tryCommitPendingActive：worker 醒来时调（每次 cmd 处理或 timeout 后）。
+  // 检查 pending 是否还在、且已经过 hold-down 时间，是的话 commit 切换。
+  void tryCommitPendingActive() {
+    std::string new_active, old_active;
     {
       std::lock_guard<std::mutex> lk(state_mu_);
-      if (new_active == current_active_)
-        return; // 没变
+      if (pending_active_.empty())
+        return;
+      auto elapsed = Clock::now() - pending_first_seen_;
+      if (elapsed < std::chrono::milliseconds(hold_down_ms_))
+        return; // 还没过 hold-down
+      if (pending_active_ == current_active_) {
+        pending_active_.clear();
+        return; // race：变成 current 了
+      }
+      new_active = pending_active_;
       old_active = current_active_;
       current_active_ = new_active;
+      pending_active_.clear();
     }
-    std::cout << "[ctrl] active speaker: '" << old_active << "' -> '"
-              << new_active << "'\n";
+    commitActiveSpeakerSwitch(old_active, new_active);
+  }
 
-    // 1. 先 sub 新 active 的 video（可能产生 keyframe 请求）
+  // Phase 8.4.2 (post-incident 2026-04-29): 切换只动 VideoRouter，**不再
+  // 调 setSubscribed(false) 退订旧 active 视频**。所有远端视频都保持
+  // subscribed，靠 router 切渲染。
+  //
+  // 为什么：实测 hold-down 600ms 仍然崩 — `corrupted double-linked list`
+  // SIGABRT 在 liblivekit_ffi 内 realloc 路径。每次 unsub 都会让 FFI 累积
+  // heap corruption（不是单纯的 churn 频率问题）。SDK 这个 race 我们改不
+  // 了，只能不触发。代价：N peer 全 stay-subscribed → N 路 HW 解码（MPP
+  // 实测 2-3 路无压力；10 路需先修 SDK bug 再优化）。
+  void commitActiveSpeakerSwitch(const std::string &old_active,
+                                 const std::string &new_active) {
+    std::cout << "[ctrl] active speaker: '" << old_active << "' -> '"
+              << new_active << "' (hold-down " << hold_down_ms_
+              << "ms, render-only switch)\n";
+
+    // 确保新 active 是 subscribed（应该一直都是 subscribed，但保险起见）
     if (auto *p = room_->remoteParticipant(new_active)) {
       for (auto &kv : p->trackPublications()) {
         const auto &pub = kv.second;
@@ -1192,57 +1270,16 @@ private:
       }
     }
 
-    // 2. 切 router 显示源
+    // 切 router 显示源（atomic，纯 C++ 状态变化，不进 FFI）
     g_video_router.setActive(new_active);
-
-    // 3. unsub 旧 active 的 video
-    if (!old_active.empty()) {
-      if (auto *p = room_->remoteParticipant(old_active)) {
-        for (auto &kv : p->trackPublications()) {
-          const auto &pub = kv.second;
-          if (pub && pub->kind() == TrackKind::KIND_VIDEO) {
-            if (pub->subscribed()) {
-              pub->setSubscribed(false);
-              std::cout << "[ctrl] unsub video: " << old_active << " sid="
-                        << kv.first << "\n";
-            }
-          }
-        }
-      }
-    }
   }
 
-  // 防御性 unsub：peer publish 了 video，如果它不是当前 active，立即 unsub
-  // 防 SDK auto_subscribe 把 10 peer 全部解码爆 CPU。
-  //
-  // 关键 corner case：current_active_ 还为空时（第一个 peer 进房，但 SDK
-  // 还没发 onActiveSpeakersChanged），**不要 defend** —— 否则第一个 peer
-  // 的视频被立刻 unsub 永远黑屏。让 SDK auto_subscribe 把第一路视频留着，
-  // VideoRouter 的 first-peer-wins 接管显示。等真有 active speaker 事件
-  // 再切换 + defend 后续来的非 active peer。
-  void handleTrackPublishedDefend(const std::string &identity,
-                                  const std::string &sid) {
-    if (identity == local_identity_)
-      return;
-    {
-      std::lock_guard<std::mutex> lk(state_mu_);
-      if (current_active_.empty())
-        return; // 还没有 active，让第一个 peer 的视频活着
-      if (identity == current_active_)
-        return; // active 自己，不动
-    }
-    auto *p = room_->remoteParticipant(identity);
-    if (!p)
-      return;
-    auto it = p->trackPublications().find(sid);
-    if (it == p->trackPublications().end())
-      return;
-    const auto &pub = it->second;
-    if (pub && pub->kind() == TrackKind::KIND_VIDEO && pub->subscribed()) {
-      pub->setSubscribed(false);
-      std::cout << "[ctrl] defend unsub non-active video: " << identity
-                << " sid=" << sid << "\n";
-    }
+  // Phase 8.4.2 (post-incident 2026-04-29): defend-unsub 也禁用 — 同样会
+  // 触发 liblivekit_ffi heap corruption。所有 peer video 留 subscribed。
+  // 10 peer 解码 CPU 风险 deferred 到 SDK FFI bug 修后再处理。
+  void handleTrackPublishedDefend(const std::string & /*identity*/,
+                                  const std::string & /*sid*/) {
+    // no-op: 见 commitActiveSpeakerSwitch 的注释
   }
 
   Room *room_;
@@ -1253,7 +1290,10 @@ private:
   std::deque<Cmd> queue_;
 
   mutable std::mutex state_mu_;
-  std::string current_active_; // protected by state_mu_
+  std::string current_active_;            // protected by state_mu_
+  std::string pending_active_;            // 候选切换目标，hold-down 期间累积
+  Clock::time_point pending_first_seen_;  // 候选首次被观察的时间
+  int hold_down_ms_ = 600;                // 默认 600ms，可 env 调
 };
 
 static std::unique_ptr<MeetingController> g_meeting_controller;
@@ -1844,11 +1884,43 @@ static void teardownFfiAndApm() {
   livekit::shutdown();
 }
 
+// Phase 8.4.4-完整 debug: SIGSEGV/SIGBUS/SIGABRT backtrace handler。
+// active speaker 切换时偶发 segfault，trace 输出到 stderr 让 smoke.sh
+// 抓得到。仅用 async-signal-safe 函数（backtrace + backtrace_symbols_fd
+// 安全），不调 malloc / printf / std::cout。
+static void crashHandler(int sig) {
+  static const char banner[] =
+      "\n=== BoardLoopback CRASH backtrace ===\nsignal=";
+  ::write(STDERR_FILENO, banner, sizeof(banner) - 1);
+  char sigbuf[16] = {0};
+  int n = sig, len = 0;
+  if (n < 0) { sigbuf[len++] = '-'; n = -n; }
+  char rev[10]; int rl = 0;
+  if (n == 0) rev[rl++] = '0';
+  while (n) { rev[rl++] = char('0' + n % 10); n /= 10; }
+  while (rl) sigbuf[len++] = rev[--rl];
+  sigbuf[len++] = '\n';
+  ::write(STDERR_FILENO, sigbuf, len);
+
+  void *frames[64];
+  int nframes = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
+  static const char tail[] = "=== end backtrace ===\n";
+  ::write(STDERR_FILENO, tail, sizeof(tail) - 1);
+
+  // 恢复默认 handler 重新触发 → 让 kernel 写 core file
+  std::signal(sig, SIG_DFL);
+  ::raise(sig);
+}
+
 int main(int argc, char *argv[]) {
   std::signal(SIGINT, handleSignal);
 #ifdef SIGTERM
   std::signal(SIGTERM, handleSignal);
 #endif
+  std::signal(SIGSEGV, crashHandler);
+  std::signal(SIGBUS, crashHandler);
+  std::signal(SIGABRT, crashHandler);
 
   // Phase 8.4.4: BOARD_API_TOKEN 是 HTTP API 的 Bearer，必填（生产防同
   // LAN 误拽）。MVP 不用 dev-mode 后门，未设直接退。

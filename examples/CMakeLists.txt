@@ -332,6 +332,10 @@ target_link_libraries(BoardLoopback
     asound
     drm
 )
+# Phase 8.4.4-完整 debug: backtrace() needs -rdynamic so dynamic symbols
+# are exported for resolution; -g keeps source-line info; both Release-safe.
+target_link_options(BoardLoopback PRIVATE -rdynamic)
+target_compile_options(BoardLoopback PRIVATE -g)
 # libdrm headers live under /usr/include/drm in Buildroot sysroot
 find_path(LIBDRM_INCLUDE_DIR drm.h PATH_SUFFIXES libdrm drm)
 if(LIBDRM_INCLUDE_DIR)

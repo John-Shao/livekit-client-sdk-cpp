@@ -412,6 +412,45 @@ FfiClient::connectAsync(const std::string &url, const std::string &token,
   return fut;
 }
 
+// Phase 8.4.4-完整: disconnectAsync — 主动通知 server 离开房间。
+// 让对端立刻收到 ParticipantDisconnected 事件，而不是依赖 server 的
+// 30s 客户端超时机制。daemon 模式下每会议结束必须调用，否则下一次
+// join 同 identity 会跟旧 ghost session 冲突（server 可能拒接或继续
+// 推 RTP 给上次的 sub）。
+std::future<proto::DisconnectCallback>
+FfiClient::disconnectAsync(std::uint64_t room_handle) {
+  const AsyncId async_id = generateAsyncId();
+
+  auto fut = registerAsync<proto::DisconnectCallback>(
+      async_id,
+      [async_id](const proto::FfiEvent &event) {
+        return event.has_disconnect() &&
+               event.disconnect().async_id() == async_id;
+      },
+      [](const proto::FfiEvent &event,
+         std::promise<proto::DisconnectCallback> &pr) {
+        pr.set_value(event.disconnect());
+      });
+
+  proto::FfiRequest req;
+  auto *disc = req.mutable_disconnect();
+  disc->set_room_handle(room_handle);
+  disc->set_request_async_id(async_id);
+  // reason 不设 — Rust on_disconnect 会用 ClientInitiated 默认
+
+  try {
+    proto::FfiResponse resp = sendRequest(req);
+    if (!resp.has_disconnect()) {
+      logAndThrow("FfiResponse missing disconnect");
+    }
+  } catch (...) {
+    cancelPendingByAsyncId(async_id);
+    throw;
+  }
+
+  return fut;
+}
+
 // Track APIs Implementation
 std::future<std::vector<RtcStats>>
 FfiClient::getTrackStatsAsync(uintptr_t track_handle) {

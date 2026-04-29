@@ -203,6 +203,34 @@ bool Room::Connect(const std::string &url, const std::string &token,
   }
 }
 
+// Phase 8.4.4-完整: 显式断开。送 DisconnectRequest 让 server 立刻广播
+// ParticipantDisconnected 给其它 peer，对端不需等 30s 客户端超时。
+void Room::Disconnect() {
+  std::shared_ptr<FfiHandle> handle_to_disconnect;
+  {
+    std::lock_guard<std::mutex> g(lock_);
+    if (connection_state_ == ConnectionState::Disconnected) {
+      // 没连或已断，no-op
+      return;
+    }
+    handle_to_disconnect = room_handle_;
+    connection_state_ = ConnectionState::Disconnected;
+  }
+  if (!handle_to_disconnect) {
+    return;
+  }
+  try {
+    auto fut =
+        FfiClient::instance().disconnectAsync(handle_to_disconnect->get());
+    // 阻塞等 FFI 返 DisconnectCallback。timeout 行为依赖 FFI 实现，
+    // 实测正常场景 < 200ms 完成。
+    fut.get();
+  } catch (const std::exception &e) {
+    LK_LOG_WARN("Room::Disconnect FFI request failed: {}", e.what());
+    // 不再抛 — 调用方期望 cleanup 路径；FFI 失败也得让 Room 析构走完
+  }
+}
+
 RoomInfoData Room::room_info() const {
   std::lock_guard<std::mutex> g(lock_);
   return room_info_;

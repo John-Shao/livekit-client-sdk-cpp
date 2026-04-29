@@ -97,6 +97,14 @@ public:
                                                    const std::string &token,
                                                    const RoomOptions &options);
 
+  // Phase 8.4.4-完整: 显式断开 Room（送 DisconnectRequest 到 FFI server →
+  // server 主动 LEAVE 房间，对端立刻看到我们离开；不再走"超时丢失"路径）。
+  // future 在 FFI 回 DisconnectCallback 后 ready；调用方应该在 reset Room
+  // 对象之前等待 future（一般 < 200ms），保证 server 收到我们离开了再做
+  // 本地资源清理。
+  std::future<proto::DisconnectCallback>
+  disconnectAsync(std::uint64_t room_handle);
+
   // Track APIs
   std::future<std::vector<RtcStats>> getTrackStatsAsync(uintptr_t track_handle);
 

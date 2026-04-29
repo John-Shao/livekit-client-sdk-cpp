@@ -134,6 +134,22 @@ public:
   bool Connect(const std::string &url, const std::string &token,
                const RoomOptions &options);
 
+  /* Phase 8.4.4-完整: actively disconnect from the room.
+   *
+   * Sends a DisconnectRequest to the FFI server, which informs the LiveKit
+   * server we're leaving. Other participants get a ParticipantDisconnected
+   * event immediately (instead of waiting ~30s for client-timeout).
+   *
+   * Blocks until the FFI returns DisconnectCallback (typically < 200ms).
+   * Safe to call multiple times — subsequent calls no-op if already in
+   * Disconnected state.
+   *
+   * Caller must call this before destroying the Room object if they want
+   * a clean session leave (otherwise Room dtor just drops the FFI handle
+   * fire-and-forget, server treats as broken connection).
+   */
+  void Disconnect();
+
   // Accessors
 
   /* Retrieve static metadata about the room.

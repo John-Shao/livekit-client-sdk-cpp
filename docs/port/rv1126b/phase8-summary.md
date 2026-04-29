@@ -146,9 +146,9 @@ Phase 7 文档"~58%"是 270s 短测，那时 codec/AEC/MPP buffer pool 都没真
 | 子阶段 | 内容 | 状态 |
 |---|---|---|
 | **8.4.1** | DrmDisplay 多 callback 安全 + VideoRouter（fix 多 peer crash）| ✅ 完成 2026-04-29 |
-| 8.4.2-MVP | onActiveSpeakersChanged + 动态 setSubscribed | ⏳ 下一步 |
-| 8.4.3 | 音频软混音器（pull 模型） | ⏳ |
-| 8.4.4-MVP | HTTP API 极简版 + Bearer auth | ⏳ |
+| **8.4.2-MVP** | onActiveSpeakersChanged + MeetingController + 动态 setSubscribed | ✅ 完成 2026-04-29 |
+| **8.4.3** | 音频软混音器（pull 模型 + AEC reverse on mix）| ✅ 完成 2026-04-29 |
+| 8.4.4-MVP | HTTP API 极简版 + Bearer auth | ⏳ 下一步 |
 | 8.4.2-完整 | hold-down 600ms + 切换体验优化 | ⏳ |
 | 8.4.4-完整 | Daemon 化 + 完整 lifecycle | ⏳ |
 | 8.4.5 | 触控 UI（OSD-on-video MVP） | ⏳ |
@@ -191,9 +191,86 @@ buffer，另一方仍持指针写入 → use-after-free。
 
 **Commit**：`22f1a44 feat(port): Phase 8.4.1 — fix multi-peer DrmDisplay crash + VideoRouter`
 
+### 8.4.2-MVP — Active speaker auto-switch + 动态订阅（done 2026-04-29）
+
+**目标**：板子屏幕跟随当前说话人自动切换；非 active peer 的视频
+unsubscribe 防 10 peer 全解码爆 CPU。
+
+**实施**：
+
+1. 新增 `class MeetingController g_meeting_controller`：单 worker thread +
+   命令队列，所有 SDK delegate 事件投递 cmd 给 worker 串行 reconcile，避免
+   多线程并发改 setSubscribed / VideoRouter active 状态。
+2. `LoopbackDelegate::onActiveSpeakersChanged`（[room_delegate.h:125-126](../../../include/livekit/room_delegate.h)）
+   过滤本地 identity，第一个非本地 speaker 投 `Cmd::ActiveSpeakerObserved` 到 controller。
+3. `LoopbackDelegate::onTrackPublished` 投 `Cmd::TrackPublishedDefend`：worker 收到后
+   检查 publication.kind() == VIDEO 且 owner 不是当前 active → `setSubscribed(false)`
+   立即退订防爆 CPU。
+4. Controller worker 处理 ActiveSpeakerObserved：
+   - new active.video.setSubscribed(true)
+   - g_video_router.setActive(new_id)
+   - old active.video.setSubscribed(false)
+5. **corner case**：current_active_ 还空时不要 defend unsub —— 让第一个 peer 的视频
+   保持 SDK auto_subscribe 状态，VideoRouter 的 first-peer-wins 接管显示。
+6. LoopbackDelegate 加 `local_identity_` 成员，main() 在 Connect 后用 `lp->identity()`
+   设置。Controller dtor 在 Room reset 之前 reset，避免 worker 访问已 reset 的 Room。
+
+**未做（留 8.4.2-完整）**：
+- hold-down 抗抖动（MVP 直接切，看 SDK speaker[0] 抖动严重再加 600ms 阻尼）
+- 切换瞬间 last-frame freeze（200-400ms 防黑屏）
+- 切换前 100ms 预 setSubscribed（启动 keyframe 请求）
+
+**验证 2026-04-29**：3 peer (Web + 手机 + 板) 真房间，A→B→A 轮流讲话，屏幕跟随
+切换。smoke.log 出 `[ctrl] active speaker: '' -> 'A-id'` / `[ctrl] sub video: A-id` /
+`[ctrl] unsub video: B-id` 三步串行 reconcile 全对。
+
+**Commit**：`5703984 feat(port): Phase 8.4.2-MVP — active speaker auto-switch + dynamic subscription`
+
+### 8.4.3 — 音频软混音器（done 2026-04-29）
+
+**起点**：8.4.2 启用多 peer 视频订阅后，音频路径暴露已知缺陷 ——
+每个 peer 的 audio callback 独立 enqueue ALSA，N peer 同时讲话时音频
+帧互相覆盖、ALSA 队列流入率 N×48kHz 但 drain 1×48kHz → 大量丢帧 +
+AEC 看到不一致 reverse signal → 实测 8.4.2 时听感"哑音 + 电流声"，
+alsa_dropped 100/秒。
+
+**实施 — push 模型改 pull 模型**：
+
+1. 新增 `class AudioMixer g_mixer`：
+   - per-peer ring buffer（500ms = 24000 samples × int16 = 48KB / peer）
+   - `write(id, samples, n)`：peer audio callback 写入对应 ring（mutex 保护）
+   - `pull(out, n)`：从所有 peer ring 各取 n samples，int32 累加 + clip int16
+     输出，单源帧
+   - `removePeer(id)`：onParticipantDisconnected 清掉对应 ring
+2. `AlsaPlayer.writerLoop` 重构：删除原 push 队列 + cv，改成每 10ms 一帧
+   `g_mixer.pull(buf, 480)` → `g_apm->processReverseStream(copy)` →
+   `snd_pcm_writei(buf)`。snd_pcm_writei 阻塞按 ALSA 节拍 pacing。
+3. audio callback：`g_mixer.write(identity, samples, n)`，删掉原 enqueue / processReverseStream。
+4. **关键调优**：MVP 第一版 ring 100ms + ALSA 1s buffer 时，writer 因 ALSA
+   period 颗粒（~250ms）阻塞期间 push 突发溢出 ring → mixer_dropped
+   55,680/秒 板子声音断续。修：ring 100ms→500ms，ALSA latency 1s→200ms
+   （period ~50ms）。
+5. ALSA playback 不再 lazy 等第一帧，main() Connect 后立刻 `g_alsa.ensureOpen(48000, 1)`
+   保证 writer 启动就有 pcm_ 可用。
+6. stat 行 `alsa_dropped` 改 `mixer_dropped`（语义已变）。
+
+**关键设计点**：
+
+- AEC reverse 看到的现在是**混好的总声**（8.4.2 之前是"恰好被先调用 callback
+  那个 peer 的 frame"）—— AEC3 自适应正确 ↑。
+- pull 模型 vs 单独 mixer thread：snd_pcm_writei 已经按 ALSA pace block，
+  让 writer 直接调 mixer.pull 拿数据，省一根线程 + 省一层 ring buffer。
+
+**验证 2026-04-29**：3 peer 同时讲话两路声都能听清；mixer_dropped 接近 0；
+alsa_underruns=0；AEC 不退化；视频切换 + active speaker 仍正常（8.4.2 回归通过）。
+
+**Commit**：`2516958 feat(port): Phase 8.4.3 — multi-peer audio software mixer + AEC reverse on mix`
+
 ### 8.4 后续 subphase
 
-详见上面表格 + 计划文件。下一步从 8.4.2-MVP 起。
+下一步 **8.4.4-MVP**：HTTP API + Bearer auth（cpp-httplib 单文件，启动 listener
+on `0.0.0.0:8080`，端点 `POST /v1/meeting/join`、`POST /v1/meeting/leave`、
+`GET /v1/meeting/status`）。详见上面表格 + 计划文件。
 
 ## 已知未做项 / 边界
 

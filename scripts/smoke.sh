@@ -29,6 +29,7 @@
 #   ./smoke.sh --aec-delay 300    stream delay (默认 300ms，2026-04-28 sweep 验证)
 #   ./smoke.sh --dac 155          DAC 喇叭音量 (默认 155=-18dB，AEC 收敛 sweet spot)
 #   ./smoke.sh --token <JWT>      显式传 token
+#   ./smoke.sh --http-only        不 auto-join，板子停在 HTTP wait 模式（测 /v1/meeting/join 用）
 #   ./smoke.sh --bg               后台跑，日志写到 /tmp/smoke.log
 #   ./smoke.sh --tail             追看最近一次后台跑的日志
 #
@@ -74,6 +75,7 @@ AEC_DELAY_MS=300
 TOKEN=""
 BG=0
 LOG=/tmp/smoke.log
+HTTP_ONLY=0
 # Phase 8.4.4: BoardLoopback 现在默认起 HTTP API 在 0.0.0.0:8080，所有 POST
 # 必须带 Authorization: Bearer <token>。如果用户没 export BOARD_API_TOKEN，
 # 这里给一个 dev-mode 默认值方便板上自测；生产部署一定要改成强随机串。
@@ -96,6 +98,7 @@ while [ $# -gt 0 ]; do
     --token)    TOKEN="$2"; shift ;;
     --url)      URL="$2"; shift ;;
     --bg)       BG=1 ;;
+    --http-only) HTTP_ONLY=1 ;;
     --tail)
                 if [ -f "$LOG" ]; then
                   tail -f "$LOG"
@@ -111,21 +114,25 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- Token 解析 ----
-if [ -z "$TOKEN" ] && [ -n "$LIVEKIT_TOKEN" ]; then
-  TOKEN="$LIVEKIT_TOKEN"
-fi
-if [ -z "$TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
-  TOKEN=$(cat "$TOKEN_FILE")
-fi
-if [ -z "$TOKEN" ]; then
-  echo "ERROR: no LIVEKIT_TOKEN provided." >&2
-  echo "  - pass --token <JWT>, OR" >&2
-  echo "  - export LIVEKIT_TOKEN, OR" >&2
-  echo "  - write JWT to $TOKEN_FILE (chmod 600)" >&2
-  echo "" >&2
-  echo "  generate via host: lk token create --room <ROOM> --identity test-user-001 \\" >&2
-  echo "                                       --join --valid-for 240h" >&2
-  exit 1
+# --http-only 模式不需要 token：板子停在 HTTP wait，由外部 POST /v1/meeting/join 投。
+if [ "$HTTP_ONLY" != "1" ]; then
+  if [ -z "$TOKEN" ] && [ -n "$LIVEKIT_TOKEN" ]; then
+    TOKEN="$LIVEKIT_TOKEN"
+  fi
+  if [ -z "$TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
+    TOKEN=$(cat "$TOKEN_FILE")
+  fi
+  if [ -z "$TOKEN" ]; then
+    echo "ERROR: no LIVEKIT_TOKEN provided." >&2
+    echo "  - pass --token <JWT>, OR" >&2
+    echo "  - export LIVEKIT_TOKEN, OR" >&2
+    echo "  - write JWT to $TOKEN_FILE (chmod 600), OR" >&2
+    echo "  - use --http-only to skip auto-join and wait for HTTP /join" >&2
+    echo "" >&2
+    echo "  generate via host: lk token create --room <ROOM> --identity test-user-001 \\" >&2
+    echo "                                       --join --valid-for 240h" >&2
+    exit 1
+  fi
 fi
 
 # ---- ES8389 mic PGA 硬件增益 + DAC 扬声器衰减 ----
@@ -143,8 +150,15 @@ sleep 1
 # ---- env ----
 cd /opt/livekit
 export LD_LIBRARY_PATH=/opt/livekit:/usr/lib
-export LIVEKIT_URL="$URL"
-export LIVEKIT_TOKEN="$TOKEN"
+# --http-only：故意不 export LIVEKIT_URL/TOKEN，BoardLoopback 启动时检测不到
+# env 就停在 HTTP wait 模式等 POST /v1/meeting/join 投。
+if [ "$HTTP_ONLY" != "1" ]; then
+  export LIVEKIT_URL="$URL"
+  export LIVEKIT_TOKEN="$TOKEN"
+else
+  unset LIVEKIT_URL
+  unset LIVEKIT_TOKEN
+fi
 export BOARD_LOOPBACK_VIDEO_CODEC="$CODEC"
 export BOARD_LOOPBACK_VIDEO_RES="$RES"
 export BOARD_LOOPBACK_VIDEO_ROTATE="$ROTATE"
@@ -175,6 +189,7 @@ echo "  use_mpp  = $USE_MPP"
 echo "  aec      = $AEC (delay=${AEC_DELAY_MS}ms; livekit::AudioProcessingModule AEC3+NS+HPF)"
 echo "  dac      = $DAC (ES8389 numid=48/49; 155=-18dB default / 191=0dB ref)"
 echo "  api      = http://0.0.0.0:$BOARD_API_PORT (Bearer auth required for POST)"
+echo "  http_only= $HTTP_ONLY (1=wait for HTTP /join, no auto-fire)"
 echo "  bg       = $BG"
 echo "  log      = $LOG (only when --bg)"
 echo "==============="

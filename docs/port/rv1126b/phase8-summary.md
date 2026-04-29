@@ -137,40 +137,63 @@ Phase 7 文档"~58%"是 270s 短测，那时 codec/AEC/MPP buffer pool 都没真
 
 预期收益 -3 ~ -5pp CPU。**不要主动做**——等业务真要 1080P30 时再来。
 
-## 8.5 — 多 peer DrmDisplay 崩溃修复（pending，已知 bug）
+## 8.4 — 业务集成（多人会议，进行中）
 
-2026-04-28 8.2 试水准备阶段发现：**第 2 个 peer 加入房间时 BoardLoopback
-segfault**。根因 [examples/board_loopback/main.cpp:917](../../../examples/board_loopback/main.cpp#L917)
-的 `static DrmDisplay g_drm` 单例被所有 subscribed video track 共用，
-[main.cpp:975](../../../examples/board_loopback/main.cpp#L975) `g_drm.renderNV12(...)`
-没加锁。两个 peer 的视频 callback 并发调 `ensureBuffers`，一方 free 旧 buffer
-另一方拿着已 free 的 mapped 指针写入 → SIGSEGV。
+产品需求已确认（2026-04-28）：max 10 participants / active speaker only /
+触控屏 / HTTP API 接 token / Bearer auth 必填。完整设计 + subphase 拆解见
+计划文件 `~/.claude/plans/wobbly-forging-moler.md`。
 
-**当前规避**：实际产品最常见就是 1-on-1 会议（板子在会议室 + 远端一人），
-这个 bug 不阻塞 production。Soak 测试期间约束房间只能 1 个 peer。
+| 子阶段 | 内容 | 状态 |
+|---|---|---|
+| **8.4.1** | DrmDisplay 多 callback 安全 + VideoRouter（fix 多 peer crash）| ✅ 完成 2026-04-29 |
+| 8.4.2-MVP | onActiveSpeakersChanged + 动态 setSubscribed | ⏳ 下一步 |
+| 8.4.3 | 音频软混音器（pull 模型） | ⏳ |
+| 8.4.4-MVP | HTTP API 极简版 + Bearer auth | ⏳ |
+| 8.4.2-完整 | hold-down 600ms + 切换体验优化 | ⏳ |
+| 8.4.4-完整 | Daemon 化 + 完整 lifecycle | ⏳ |
+| 8.4.5 | 触控 UI（OSD-on-video MVP） | ⏳ |
+| 8.4.6 | 集成测试 + 多人 4h soak | ⏳ |
 
-**修复路线（推荐 a）**：
+### 8.4.1 — DrmDisplay 多 callback 安全 + VideoRouter（done 2026-04-29）
 
-a. **单显示器渲染策略 + first-track-only**：第一个 subscribed video track 注册
-   render callback，后续 track 只统计不显示。符合"板子是会议室单显示器"语义，
-   工程量 ~30 行代码 + brief 测试。
+**起点**：2026-04-28 8.2 试水准备时发现，第 2 个 peer 加入房间触发
+SIGSEGV。根因 `static DrmDisplay g_drm` 单例无锁 —— 两个 peer 的 video
+callback 并发调 `ensureBuffers`，新 frame 尺寸不同时一方 free 旧 mapped
+buffer，另一方仍持指针写入 → use-after-free。
 
-b. DrmDisplay 加 mutex + 支持动态 reallocate；外加"显示哪一路"策略（active
-   speaker / 用户 pin / round-robin）。复杂得多，等真要多人通话场景再做。
+**修法**：
 
-**优先级**：中。8.2 SLA 通过 + 8.4 业务集成时如果产品要"多人会议"功能，
-8.5 升优先做完才能进 8.4。
+1. `DrmDisplay::renderNV12` 加 `std::mutex render_mutex_` 保护 ensureBuffers
+   的 free/realloc 临界区（兜底防护，即使 router 失效也不崩）。
+2. 引入 `class VideoRouter g_video_router`：
+   - `renderIfActive(id, data, w, h)`：只有 id 等于 active 才进 DrmDisplay；
+     不等的 callback 第一行就 return（99% 路径零开销）。
+   - 第一个 peer 自动成为 active（first-peer-wins，简单 MVP 行为）。
+   - `setActive(id)` / `resetIfActive(id)`：8.4.2 active speaker handler 用
+     这两个 API 在多 peer 场景动态切显示。
+3. `LoopbackDelegate::onTrackSubscribed` 的 video callback 改成
+   `g_video_router.renderIfActive(identity, ...)`；`onParticipantDisconnected`
+   调 `g_video_router.resetIfActive(identity)` 让下一个 peer 接管显示。
 
-## 8.4 — 业务集成（pending）
+**验证 2026-04-29**：
 
-Phase 7 阶段板↔Web 通话已稳定，可以开始接产品业务逻辑：
+- ✅ 单 peer：Web peer 进房，板子启动 → `[router] first peer wins active: <id>`，
+  `[drm] dumb buffers ready: 2x 1280x720 NV12`（一次分配），video 正常显示。
+- ✅ 多 peer：手机加入第 2 路（之前必崩的剧本）→ 不 segfault，没有第 2 次
+  `[drm] dumb buffers ready` 重分配，没有 `mpp_buf_slot mismatch` 警告，
+  屏幕保持显示 Web peer。
+- 其他没动：1-peer 视频路径性能无退化（router 早 return 不上锁），AEC 行为不变。
 
-- 房间管理（创建 / 加入 / 离开 / 列表）
-- 多人通话（>2 人 simulcast 行为复核）
-- 数据通道（LiveKit data track 当前 SCTP/DTLS 协商失败，jusiai NAT 路径要 server 配合排查）
-- 业务侧 UI / 状态机
+**未做（留 8.4.2）**：active speaker 自动切换（当前是 first-peer-wins 静态绑定）。
+多 peer 时手机视频仍被静默丢弃，由 8.4.2 的 `onActiveSpeakersChanged` 接管。
+另：多 peer 音频还是各 callback 直接 enqueue ALSA（旧行为，可能互相覆盖），
+由 8.4.3 软混音器修。
 
-**前置**：跟产品确认 MVP 功能集，再决定切入点。
+**Commit**：`22f1a44 feat(port): Phase 8.4.1 — fix multi-peer DrmDisplay crash + VideoRouter`
+
+### 8.4 后续 subphase
+
+详见上面表格 + 计划文件。下一步从 8.4.2-MVP 起。
 
 ## 已知未做项 / 边界
 

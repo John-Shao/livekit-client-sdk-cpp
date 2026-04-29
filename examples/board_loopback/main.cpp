@@ -57,6 +57,7 @@
 #include <drm/drm_fourcc.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -66,11 +67,13 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace livekit;
@@ -190,6 +193,106 @@ static std::atomic<bool> g_apm_ready{false};
 // SDK's subscription thread from the codec's hardware pacing and
 // avoids back-pressure-induced underruns.
 // ---------------------------------------------------------------
+// AudioMixer — Phase 8.4.3
+// ---------------------------------------------------------------
+// 多 peer 音频软混音器。每 peer 一个 100ms ring buffer，写者是各 peer 的
+// audio callback（独立线程），读者是 ALSA writer 线程（pull 模型）。
+//
+// 关键设计：**pull 而不是 push**。原 AlsaPlayer 是 push 模型，每个 peer
+// callback 各自 enqueue ALSA 队列 → N 个 peer 的 sample rate 叠加进队列，
+// drain 不过来就丢。新 pull 模型：ALSA writer 线程按 10ms 节奏 pull 一帧
+// 出来，混音器把各 peer ring 当前的 480 samples 求和 + clip 输出，单源
+// 馈给 ALSA + AEC reverse → 帧级语义干净。
+//
+// SPSC 性质：每个 peer 一个 ring，仅一个 SDK 线程写、ALSA 线程读。整体
+// 用单 mutex 保护 ring map + ring 状态，临界区很短（拷贝 samples），
+// 10 peer × 100Hz × 480 samples 的负载可忽略。
+class AudioMixer {
+public:
+  // 500ms @ 48kHz mono = 24000 samples × 2 byte = 48 KB / peer。
+  // 大于 ALSA period 颗粒（即便配 1s buffer，period 可能 250ms），保证
+  // writer 短暂阻塞期间 push 不溢出。10 peer × 48 KB = 480 KB，可接受。
+  static constexpr std::size_t kRingCapacitySamples = 24000;
+  static constexpr int kSampleRate = 48000;
+  static constexpr int kChannels = 1;
+
+  struct Ring {
+    std::array<std::int16_t, kRingCapacitySamples> buf{};
+    std::size_t write_pos = 0;
+    std::size_t read_pos = 0;
+    std::size_t fill = 0; // 已写但未读的样本数
+  };
+
+  // 写入指定 peer 的 ring。ring 满时丢最旧 sample（保新弃旧 = 低延迟）。
+  void write(const std::string &id, const std::int16_t *samples,
+             std::size_t n) {
+    if (n == 0)
+      return;
+    std::lock_guard<std::mutex> lk(mu_);
+    auto &ring = rings_[id];
+    for (std::size_t i = 0; i < n; ++i) {
+      if (ring.fill >= kRingCapacitySamples) {
+        // overrun：丢最旧 1 sample
+        ring.read_pos = (ring.read_pos + 1) % kRingCapacitySamples;
+        ring.fill -= 1;
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+      }
+      ring.buf[ring.write_pos] = samples[i];
+      ring.write_pos = (ring.write_pos + 1) % kRingCapacitySamples;
+      ring.fill += 1;
+    }
+  }
+
+  // 从所有 peer ring 各取 n samples，求和 + clip 写到 out。
+  // 返回是否有任何 peer 提供数据（false = 静音输出）。
+  bool pull(std::int16_t *out, std::size_t n) {
+    // 用 int32 累加器避免溢出
+    std::vector<std::int32_t> acc(n, 0);
+    bool any = false;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (auto &kv : rings_) {
+        auto &ring = kv.second;
+        if (ring.fill == 0)
+          continue;
+        any = true;
+        const std::size_t take = std::min(ring.fill, n);
+        for (std::size_t i = 0; i < take; ++i) {
+          acc[i] += ring.buf[ring.read_pos];
+          ring.read_pos = (ring.read_pos + 1) % kRingCapacitySamples;
+        }
+        ring.fill -= take;
+        // take < n 时尾部留 0，别的 peer 可能补上去（或全 0 = 静音）
+      }
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+      std::int32_t v = acc[i];
+      if (v > std::numeric_limits<std::int16_t>::max())
+        v = std::numeric_limits<std::int16_t>::max();
+      else if (v < std::numeric_limits<std::int16_t>::min())
+        v = std::numeric_limits<std::int16_t>::min();
+      out[i] = static_cast<std::int16_t>(v);
+    }
+    return any;
+  }
+
+  void removePeer(const std::string &id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    rings_.erase(id);
+  }
+
+  std::uint64_t dropped() const {
+    return dropped_.load(std::memory_order_relaxed);
+  }
+
+private:
+  std::mutex mu_;
+  std::unordered_map<std::string, Ring> rings_;
+  std::atomic<std::uint64_t> dropped_{0};
+};
+
+static AudioMixer g_mixer;
+
 class AlsaPlayer {
 public:
   // Init from first audio frame's params and start the writer thread.
@@ -215,10 +318,14 @@ public:
                 << snd_strerror(err) << "\n";
       return false;
     }
+    // Phase 8.4.3: 把 latency 从 1s 缩到 200ms，让 writer thread 的
+    // snd_pcm_writei 阻塞颗粒变小（从 ~250ms period 跌到 ~50ms 量级），
+    // pull 不至于长时间停顿 → AudioMixer ring 溢出概率降到底。
+    // 200ms 仍留足 jitter buffer 余量给手机/Web 端 RTP 抖动。
     err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE,
                              SND_PCM_ACCESS_RW_INTERLEAVED, num_channels,
                              sample_rate, /*soft_resample=*/1,
-                             /*latency_us=*/1000000); // 1s 缓冲，留足 jitter 余量
+                             /*latency_us=*/200000); // 200ms 缓冲
     if (err < 0) {
       std::cerr << "[loopback] alsa snd_pcm_set_params failed: "
                 << snd_strerror(err) << "\n";
@@ -229,42 +336,17 @@ public:
     sr_ = sample_rate;
     ch_ = num_channels;
     std::cout << "[loopback] alsa playback opened: " << device << " "
-              << sample_rate << "Hz " << num_channels << "ch s16le 1s-buf\n";
+              << sample_rate << "Hz " << num_channels << "ch s16le 200ms-buf\n";
     writer_ = std::thread(&AlsaPlayer::writerLoop, this);
     return true;
-  }
-
-  // Called from SDK subscription thread — must be cheap (no PCM blocking).
-  void enqueue(const std::int16_t *samples, std::size_t samples_per_channel) {
-    if (!pcm_)
-      return; // not opened yet (first-frame ensureOpen path)
-    {
-      std::lock_guard<std::mutex> lk(q_mu_);
-      // Drop oldest if FIFO grows beyond ~500ms to bound memory in case the
-      // codec is slower than producer (shouldn't happen at 48kHz mono but
-      // safety net). 500ms @ 48k mono int16 = 48KB/frame*50frames ≈ 2.4MB.
-      if (queue_.size() > 50) {
-        queue_.pop_front();
-        dropped_.fetch_add(1, std::memory_order_relaxed);
-      }
-      queue_.emplace_back(samples, samples + samples_per_channel);
-    }
-    q_cv_.notify_one();
   }
 
   std::uint64_t underruns() const {
     return underruns_.load(std::memory_order_relaxed);
   }
-  std::uint64_t queue_dropped() const {
-    return dropped_.load(std::memory_order_relaxed);
-  }
 
   ~AlsaPlayer() {
-    {
-      std::lock_guard<std::mutex> lk(q_mu_);
-      stop_ = true;
-    }
-    q_cv_.notify_all();
+    stop_.store(true, std::memory_order_release);
     if (writer_.joinable())
       writer_.join();
     if (pcm_) {
@@ -275,22 +357,39 @@ public:
   }
 
 private:
+  // Phase 8.4.3: pull 模型。每 10ms 从 g_mixer 拉一帧 480 samples，
+  // 喂 APM AEC reverse stream（让 AEC 看到混好的总声），再 snd_pcm_writei。
+  // snd_pcm_writei 阻塞到 ALSA 接受 → 自然按 48kHz/480 = 10ms 节拍。
+  // mixer 没数据时输出静音（不能不写，否则 ALSA underrun 出 pop 声）。
   void writerLoop() {
-    std::vector<std::int16_t> frame;
-    while (true) {
-      {
-        std::unique_lock<std::mutex> lk(q_mu_);
-        q_cv_.wait(lk, [this]() { return stop_ || !queue_.empty(); });
-        if (stop_ && queue_.empty())
-          return;
-        frame = std::move(queue_.front());
-        queue_.pop_front();
-      }
-      if (!pcm_ || frame.empty())
+    constexpr std::size_t kSamplesPerTick = 480; // 10ms @ 48kHz mono
+    std::vector<std::int16_t> mixed(kSamplesPerTick);
+    while (!stop_.load(std::memory_order_acquire)) {
+      if (!pcm_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         continue;
-      const std::size_t spc = frame.size() / ch_;
+      }
+      // 拉一帧混音；mixer 空时返回静音（all-zero buf 已由 pull 写好）
+      g_mixer.pull(mixed.data(), kSamplesPerTick);
+
+      // 喂 AEC reverse —— processReverseStream 移动 frame 内部 vector，
+      // 所以传 copy；播放仍用 mixed 原 buf。
+      if (g_apm_ready.load(std::memory_order_acquire)) {
+        AudioFrame reverse_frame(
+            std::vector<std::int16_t>(mixed.begin(), mixed.end()),
+            AudioMixer::kSampleRate, AudioMixer::kChannels,
+            static_cast<int>(kSamplesPerTick));
+        try {
+          g_apm->processReverseStream(reverse_frame);
+        } catch (const std::exception &e) {
+          std::cerr << "[loopback] APM processReverseStream err: " << e.what()
+                    << "\n";
+        }
+      }
+
+      // 阻塞 write，ALSA 自然按硬件节拍 pace 这个循环
       snd_pcm_sframes_t written =
-          snd_pcm_writei(pcm_, frame.data(), spc);
+          snd_pcm_writei(pcm_, mixed.data(), kSamplesPerTick);
       if (written < 0) {
         const int err = static_cast<int>(written);
         if (err == -EPIPE)
@@ -305,14 +404,10 @@ private:
   int sr_ = 0;
   int ch_ = 0;
 
-  std::mutex q_mu_;
-  std::condition_variable q_cv_;
-  std::deque<std::vector<std::int16_t>> queue_;
-  bool stop_ = false;
+  std::atomic<bool> stop_{false};
   std::thread writer_;
 
   std::atomic<std::uint64_t> underruns_{0};
-  std::atomic<std::uint64_t> dropped_{0};
 };
 
 static AlsaPlayer g_alsa;
@@ -1171,6 +1266,9 @@ public:
       // Phase 8.4.1: 如果离开的是当前 active 渲染的 peer，清空 router；
       // 下一个还在房间里的 peer 的下一帧到来时自动接管。
       g_video_router.resetIfActive(id);
+      // Phase 8.4.3: 清掉这个 peer 的 audio ring buffer，省内存（10 peer
+      // × 100ms ring = ~9.6KB，无所谓但语义干净）。
+      g_mixer.removePeer(id);
     }
   }
 
@@ -1266,41 +1364,24 @@ public:
       const TrackSource src = ev.track->source().value_or(
           TrackSource::SOURCE_MICROPHONE);
       room.setOnAudioFrameCallback(
-          identity, src, [stats](const AudioFrame &frame) {
+          identity, src, [stats, identity](const AudioFrame &frame) {
             const auto n = stats->audio_frames.fetch_add(
                 1, std::memory_order_relaxed);
             // 第一帧打印一次实际 PCM 参数，帮助排查音质问题
             if (n == 0) {
-              std::cout << "[loopback] first audio frame: rate="
-                        << frame.sample_rate() << "Hz channels="
-                        << frame.num_channels() << " samples_per_ch="
-                        << frame.samples_per_channel() << " buf_size="
-                        << frame.data().size() << "\n";
+              std::cout << "[loopback] first audio frame [" << identity
+                        << "]: rate=" << frame.sample_rate()
+                        << "Hz channels=" << frame.num_channels()
+                        << " samples_per_ch=" << frame.samples_per_channel()
+                        << " buf_size=" << frame.data().size() << "\n";
             }
-            // Phase 7.4: feed APM the playback frame as reverse stream
-            // BEFORE we hand it to ALSA — APM uses this as the AEC
-            // reference signal it'll subtract from the mic-side capture
-            // a few hundred ms later (delay set via setStreamDelayMs).
-            // We pass a copy because processReverseStream modifies in-
-            // place; the original frame is what we actually play.
-            if (g_apm_ready.load()) {
-              AudioFrame reverse_copy(frame.data(), frame.sample_rate(),
-                                     frame.num_channels(),
-                                     frame.samples_per_channel());
-              try {
-                g_apm->processReverseStream(reverse_copy);
-              } catch (const std::exception &e) {
-                std::cerr << "[loopback] APM processReverseStream err: "
-                          << e.what() << "\n";
-              }
-            }
-            // 把远端音频写到板上 ALSA codec (ES8389)，让 board 真的
-            // "开口"。lazy-init 用第一帧的 sample_rate/channels。
-            if (g_alsa.ensureOpen(frame.sample_rate(), frame.num_channels())) {
-              const auto &samples = frame.data();
-              if (!samples.empty()) {
-                g_alsa.enqueue(samples.data(), frame.samples_per_channel());
-              }
+            // Phase 8.4.3: 不再直接 enqueue ALSA / processReverseStream。
+            // 写到 g_mixer 的 per-peer ring，ALSA writer 线程按 10ms 节奏
+            // pull 混音输出 → 单源馈给 ALSA + AEC reverse stream。
+            const auto &samples = frame.data();
+            if (!samples.empty()) {
+              g_mixer.write(identity, samples.data(),
+                            frame.samples_per_channel());
             }
           });
     }
@@ -1411,6 +1492,14 @@ int main(int argc, char *argv[]) {
   delegate.setLocalIdentity(lp->identity());
   g_meeting_controller =
       std::make_unique<MeetingController>(room.get(), lp->identity());
+
+  // Phase 8.4.3: ALSA playback 提前开（不再 lazy 等第一帧），让 pull 模型
+  // 的 writer 线程一启动就有 pcm_ 可用。所有远端 audio 已知 48kHz mono
+  // (LiveKit FFI 输出固定，跟 AudioMixer::kSampleRate / kChannels 对齐)。
+  if (!g_alsa.ensureOpen(AudioMixer::kSampleRate, AudioMixer::kChannels)) {
+    std::cerr << "[loopback] WARN: ALSA playback open failed at startup; "
+                 "remote audio will be silent\n";
+  }
 
   // Publish video. Try opening the on-board V4L2 camera (rkisp_mainpath
   // via /dev/video-camera0); fall back to synthetic gradient if it fails
@@ -1697,7 +1786,7 @@ int main(int argc, char *argv[]) {
       std::cout << "[loopback] T+" << secs << "s  published " << frame_count
                 << " video frames; alsa_underruns="
                 << g_alsa.underruns()
-                << " alsa_dropped=" << g_alsa.queue_dropped() << "\n";
+                << " mixer_dropped=" << g_mixer.dropped() << "\n";
       std::cout << "[loopback] remote streams:\n";
       g_stats.print(std::cout);
     }

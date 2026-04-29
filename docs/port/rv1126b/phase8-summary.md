@@ -149,8 +149,8 @@ Phase 7 文档"~58%"是 270s 短测，那时 codec/AEC/MPP buffer pool 都没真
 | **8.4.2-MVP** | onActiveSpeakersChanged + MeetingController + 动态 setSubscribed | ✅ 完成 2026-04-29 |
 | **8.4.3** | 音频软混音器（pull 模型 + AEC reverse on mix）| ✅ 完成 2026-04-29 |
 | **8.4.4-MVP** | HTTP API 极简版 + Bearer auth | ✅ 完成 2026-04-29 |
+| **8.4.4-完整** | Daemon 化 + per-meeting FFI lifecycle + Room::Disconnect | ✅ 完成 2026-04-29 |
 | 8.4.2-完整 | hold-down 600ms + 切换体验优化 | ⏳ |
-| 8.4.4-完整 | Daemon 化 + 完整 lifecycle | ⏳ |
 | 8.4.5 | 触控 UI（OSD-on-video MVP） | ⏳ |
 | 8.4.6 | 集成测试 + 多人 4h soak | ⏳ |
 
@@ -345,12 +345,68 @@ $ curl -s -X POST -H "Authorization: Bearer <token>" http://localhost:8080/v1/me
 
 **Commit**：`5dad383 feat(port): Phase 8.4.4-MVP — HTTP API + Bearer auth for meeting join/leave`
 
+### 8.4.4-完整 — Daemon 化 + per-meeting FFI lifecycle（done 2026-04-29）
+
+**起点**：MVP 单会议进程（一次 leave 退一次进程，下次 join 后端要重新拉
+板子启动），不是产品级 daemon。本阶段把 BoardLoopback 改成长跑进程，HTTP
+/join 可重复触发；同时修了一个伴生的 server-side 残留 bug：MVP 时手机端
+看到板子退会要等 ~30s 客户端超时，因为 Room 析构是 fire-and-forget drop
+FFI handle，没有通知 server "我主动 LEAVE"。
+
+**实施**:
+
+1. **MeetingState 加 Shutdown 状态** + `requestShutdown()` + `waitForJoinOrShutdown()`
+   返 `std::optional`。signal handler 投 requestShutdown 让 main 解阻塞退外循环。
+   注意：`std::lock_guard + cv.notify` 在 signal handler 严格上不 async-signal-safe
+   （pthread_mutex_lock 不在 POSIX safe 列表上），实践 mutex 极短不死锁，留 self-pipe
+   trick 做后续改进。
+2. **main() 改外循环 while(true)**：每轮 `waitForJoinOrShutdown` → setupFfiAndApm
+   → 跑会议体（do/while(false) 块作用域确保 RAII 清理）→ Room::Disconnect →
+   room.reset → teardownFfiAndApm → continue 等下次 /join。Connect 失败 continue
+   不退 daemon。
+3. **per-meeting FFI 重做**：`livekit::initialize` + APM 创建移到 setupFfiAndApm，
+   会议结束 teardownFfiAndApm 调 livekit::shutdown 整个 Rust runtime tear-down。
+   代价 ~100-300ms cold start / 会议；收益是上轮的残余 RTP / subscription thread /
+   frame callback 完全 stage cleared，不会泄漏到下轮。
+4. **SDK 加 Room::Disconnect()**（[include/livekit/room.h](../../../include/livekit/room.h),
+   [src/room.cpp](../../../src/room.cpp)）：送 DisconnectRequest 到 FFI server，阻塞
+   等 DisconnectCallback（实测 < 200ms）。配套加 `FfiClient::disconnectAsync(room_handle)`
+   做 async 关联（[src/ffi_client.cpp](../../../src/ffi_client.cpp)）。Room::Disconnect
+   幂等，已 Disconnected no-op。
+5. **会议体退出顺序**：tracks/source/video reset → `room->Disconnect()` → room.reset
+   → teardownFfiAndApm → log idle → 回外循环。
+
+**为什么必须显式 Disconnect**：MVP 时 Room 析构只 drop FFI handle，server
+看不到 "client 离开"，仍认为板子在房间，对端要等 ~30s 客户端超时才看到退
+会。daemon 模式下问题更严重 —— 下次 /join 同 identity 进来，server 可能
+判为 reconnect 跟旧 ghost session 冲突。Disconnect() 让 server 立刻广播
+ParticipantDisconnected，对端 < 1s 看到退会。
+
+**实测验证 2026-04-29**:
+
+```
+T0   curl /join → 板子加入
+T~5s 手机看到板子有视频
+T10s curl /leave
+T<1s 手机端立即看到板子参与者从房间消失（不是 30s 超时！）✅
+T~10s 板子日志：[loopback] disconnecting... → [daemon] meeting cleaned up;
+       idle, waiting for next /join or signal ✅
+T20s curl /join (新 url + token) → 板子第二轮加房 ✅
+T~5s 第二轮会议正常工作（视频 + 音频 + active speaker 切换）✅
+```
+
+50-cycle join/leave + vmrss 监控验证留给 8.4.6 多人 soak 一起跑。
+
+**Commits**:
+- `4b84d56 feat(sdk): add Room::Disconnect() for synchronous server-side leave`
+- `f4c2b7a feat(port): Phase 8.4.4-完整 — daemon mode with per-meeting FFI lifecycle`
+
 ### 8.4 后续 subphase
 
-**MVP（8.4.1+8.4.2-MVP+8.4.3+8.4.4-MVP）已完成 ✅**。剩下增量做产品级：
+**MVP + 8.4.4-完整 已完成 ✅**。剩下：
 
-下一步 **8.4.5**（OSD-on-video 触控 UI）或 **8.4.4-完整**（daemon 化）—
-看产品优先级。详见上面表格 + [计划文件](../../../../../../Users/19146/.claude/plans/wobbly-forging-moler.md)。
+下一步 **8.4.5**（OSD-on-video 触控 UI）或 **8.4.2-完整**（hold-down + 切换
+体验）— 看产品优先级。详见上面表格 + [计划文件](../../../../../../Users/19146/.claude/plans/wobbly-forging-moler.md)。
 
 ## 已知未做项 / 边界
 

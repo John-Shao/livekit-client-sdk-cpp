@@ -985,6 +985,174 @@ private:
 
 static VideoRouter g_video_router;
 
+// MeetingController — Phase 8.4.2-MVP
+// ---------------------------------------------------------------
+// 单 worker thread + 命令队列，串行处理 active speaker 切换 + 视频订阅
+// 控制。所有 SDK delegate 事件都投递 Cmd 进队列，worker 串行 reconcile，
+// 避免多 delegate 线程并发改 setSubscribed / VideoRouter active 状态。
+//
+// MVP 行为（不带 hold-down 抗抖动，看到 SDK 抖多严重再决定加多长）：
+//   - onActiveSpeakersChanged → ActiveSpeakerObserved cmd
+//   - onTrackPublished(VIDEO) → TrackPublishedDefend cmd（非 active 立即 unsub
+//     防 10 peer 全订阅解码爆 CPU）
+//   - 切换：new_active.video.setSubscribed(true) → router.setActive →
+//     old_active.video.setSubscribed(false)
+class MeetingController {
+public:
+  enum class CmdType {
+    ActiveSpeakerObserved, // identity = 新 active 的 id
+    TrackPublishedDefend,  // identity = pub owner，sid = pub.sid
+    Shutdown,
+  };
+  struct Cmd {
+    CmdType type;
+    std::string identity;
+    std::string sid;
+  };
+
+  MeetingController(Room *room, std::string local_identity)
+      : room_(room), local_identity_(std::move(local_identity)) {
+    worker_ = std::thread([this] { workerLoop(); });
+  }
+
+  ~MeetingController() {
+    enqueue({CmdType::Shutdown, "", ""});
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+  void enqueue(Cmd cmd) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      queue_.push_back(std::move(cmd));
+    }
+    cv_.notify_one();
+  }
+
+  // 直接给 LoopbackDelegate / 其它地方读：当前 active 是谁（仅供日志/UI 用）。
+  std::string currentActive() const {
+    std::lock_guard<std::mutex> lk(state_mu_);
+    return current_active_;
+  }
+
+private:
+  void workerLoop() {
+    while (true) {
+      Cmd cmd;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return !queue_.empty(); });
+        cmd = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      switch (cmd.type) {
+      case CmdType::Shutdown:
+        return;
+      case CmdType::ActiveSpeakerObserved:
+        handleActiveSpeaker(cmd.identity);
+        break;
+      case CmdType::TrackPublishedDefend:
+        handleTrackPublishedDefend(cmd.identity, cmd.sid);
+        break;
+      }
+    }
+  }
+
+  // 切换 active：sub 新的 video，setActive，unsub 旧的。
+  void handleActiveSpeaker(const std::string &new_active) {
+    if (new_active.empty())
+      return;
+    std::string old_active;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      if (new_active == current_active_)
+        return; // 没变
+      old_active = current_active_;
+      current_active_ = new_active;
+    }
+    std::cout << "[ctrl] active speaker: '" << old_active << "' -> '"
+              << new_active << "'\n";
+
+    // 1. 先 sub 新 active 的 video（可能产生 keyframe 请求）
+    if (auto *p = room_->remoteParticipant(new_active)) {
+      for (auto &kv : p->trackPublications()) {
+        const auto &pub = kv.second;
+        if (pub && pub->kind() == TrackKind::KIND_VIDEO) {
+          if (!pub->subscribed()) {
+            pub->setSubscribed(true);
+            std::cout << "[ctrl] sub video: " << new_active << " sid="
+                      << kv.first << "\n";
+          }
+        }
+      }
+    }
+
+    // 2. 切 router 显示源
+    g_video_router.setActive(new_active);
+
+    // 3. unsub 旧 active 的 video
+    if (!old_active.empty()) {
+      if (auto *p = room_->remoteParticipant(old_active)) {
+        for (auto &kv : p->trackPublications()) {
+          const auto &pub = kv.second;
+          if (pub && pub->kind() == TrackKind::KIND_VIDEO) {
+            if (pub->subscribed()) {
+              pub->setSubscribed(false);
+              std::cout << "[ctrl] unsub video: " << old_active << " sid="
+                        << kv.first << "\n";
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 防御性 unsub：peer publish 了 video，如果它不是当前 active，立即 unsub
+  // 防 SDK auto_subscribe 把 10 peer 全部解码爆 CPU。
+  //
+  // 关键 corner case：current_active_ 还为空时（第一个 peer 进房，但 SDK
+  // 还没发 onActiveSpeakersChanged），**不要 defend** —— 否则第一个 peer
+  // 的视频被立刻 unsub 永远黑屏。让 SDK auto_subscribe 把第一路视频留着，
+  // VideoRouter 的 first-peer-wins 接管显示。等真有 active speaker 事件
+  // 再切换 + defend 后续来的非 active peer。
+  void handleTrackPublishedDefend(const std::string &identity,
+                                  const std::string &sid) {
+    if (identity == local_identity_)
+      return;
+    {
+      std::lock_guard<std::mutex> lk(state_mu_);
+      if (current_active_.empty())
+        return; // 还没有 active，让第一个 peer 的视频活着
+      if (identity == current_active_)
+        return; // active 自己，不动
+    }
+    auto *p = room_->remoteParticipant(identity);
+    if (!p)
+      return;
+    auto it = p->trackPublications().find(sid);
+    if (it == p->trackPublications().end())
+      return;
+    const auto &pub = it->second;
+    if (pub && pub->kind() == TrackKind::KIND_VIDEO && pub->subscribed()) {
+      pub->setSubscribed(false);
+      std::cout << "[ctrl] defend unsub non-active video: " << identity
+                << " sid=" << sid << "\n";
+    }
+  }
+
+  Room *room_;
+  std::string local_identity_;
+  std::thread worker_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Cmd> queue_;
+
+  mutable std::mutex state_mu_;
+  std::string current_active_; // protected by state_mu_
+};
+
+static std::unique_ptr<MeetingController> g_meeting_controller;
+
 class LoopbackDelegate : public RoomDelegate {
 public:
   void onParticipantConnected(Room &,
@@ -1005,6 +1173,51 @@ public:
       g_video_router.resetIfActive(id);
     }
   }
+
+  // Phase 8.4.2: 远端发布 track 通知。video track 进来如果不是当前 active，
+  // 立刻让 controller 来 unsub，省 CPU；audio track 不动（任何时候都要订阅，
+  // 8.4.3 软混音才有数据可混）。
+  void onTrackPublished(Room &, const TrackPublishedEvent &ev) override {
+    if (!ev.participant || !ev.publication)
+      return;
+    const std::string identity = ev.participant->identity();
+    const std::string sid = ev.publication->sid();
+    const TrackKind kind = ev.publication->kind();
+    std::cout << "[loopback] track published: " << identity << " kind="
+              << (kind == TrackKind::KIND_VIDEO ? "video"
+                  : kind == TrackKind::KIND_AUDIO ? "audio"
+                                                  : "unknown")
+              << " sid=" << sid << "\n";
+    if (kind == TrackKind::KIND_VIDEO && g_meeting_controller) {
+      g_meeting_controller->enqueue(
+          {MeetingController::CmdType::TrackPublishedDefend, identity, sid});
+    }
+  }
+
+  // Phase 8.4.2: SDK 推 active speaker 列表过来；首个非本地 speaker 视为
+  // 当前 active，投给 controller 做切换。MVP 不带 hold-down，看到抖动严重
+  // 再加 600ms 阻尼。
+  void onActiveSpeakersChanged(
+      Room &, const ActiveSpeakersChangedEvent &ev) override {
+    if (!g_meeting_controller)
+      return;
+    std::string new_active;
+    for (auto *p : ev.speakers) {
+      if (!p)
+        continue;
+      const std::string id = p->identity();
+      if (id == local_identity_)
+        continue; // 跳过自己
+      new_active = id;
+      break;
+    }
+    if (new_active.empty())
+      return; // 全是本地 / 列表空，不切
+    g_meeting_controller->enqueue(
+        {MeetingController::CmdType::ActiveSpeakerObserved, new_active, ""});
+  }
+
+  void setLocalIdentity(std::string id) { local_identity_ = std::move(id); }
 
   void onTrackSubscribed(Room &room,
                          const TrackSubscribedEvent &ev) override {
@@ -1092,6 +1305,9 @@ public:
           });
     }
   }
+
+private:
+  std::string local_identity_; // Phase 8.4.2: 给 onActiveSpeakersChanged 过滤
 };
 
 int main(int argc, char *argv[]) {
@@ -1187,6 +1403,14 @@ int main(int argc, char *argv[]) {
   LocalParticipant *lp = room->localParticipant();
   std::cout << "[loopback] connected as identity='" << lp->identity()
             << "' room='" << room->room_info().name << "'\n";
+
+  // Phase 8.4.2: 起 MeetingController，将 SDK delegate 投来的 active
+  // speaker / track published 事件串行 reconcile（避免多 delegate 线程
+  // 并发改 setSubscribed / VideoRouter active 状态）。delegate 的
+  // local_identity 也得知道，以便 onActiveSpeakersChanged 跳过自己。
+  delegate.setLocalIdentity(lp->identity());
+  g_meeting_controller =
+      std::make_unique<MeetingController>(room.get(), lp->identity());
 
   // Publish video. Try opening the on-board V4L2 camera (rkisp_mainpath
   // via /dev/video-camera0); fall back to synthetic gradient if it fails
@@ -1491,6 +1715,9 @@ int main(int argc, char *argv[]) {
   std::cout << "[loopback] disconnecting...\n";
   if (audio_thread.joinable())
     audio_thread.join();
+  // Phase 8.4.2: 先停 controller worker（避免 worker 在 room 已 reset 后
+  // 还尝试访问 remoteParticipant）。它 dtor 会发 Shutdown cmd + join。
+  g_meeting_controller.reset();
   // Drop tracks first, then room
   audio_track.reset();
   audio_source.reset();

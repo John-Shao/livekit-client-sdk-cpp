@@ -976,69 +976,142 @@ public:
   // Scales src (src_w × src_h) into the (dst_x, dst_y, dst_w, dst_h) rect of
   // a canvas described by (cy, cuv, canvas_pitch, canvas_h).
   // Fill mode: center-crops src to dst aspect ratio before scaling.
+  // rotate_cw90=true: treat src as 90° CW rotated (logical dims swap to
+  // src_h×src_w); maps dest pixel (lsx,lsy) → actual src (lsy, src_h-1-lsx).
+  // Used to correct camera frames that are physically portrait-mounted but
+  // output landscape data from the sensor.
   static void scaleNV12Blit(std::uint8_t *cy, std::uint8_t *cuv,
                              int canvas_pitch, int canvas_h,
                              int dst_x, int dst_y, int dst_w, int dst_h,
-                             const std::uint8_t *src, int src_w, int src_h) {
+                             const std::uint8_t *src, int src_w, int src_h,
+                             bool rotate_cw90 = false) {
     (void)canvas_h;
-    // Compute fill-mode crop window (center-crop src to dst aspect ratio)
-    int cx = 0, cy_off = 0, cw = src_w, ch = src_h;
+    // Logical source dims after optional 90° CW rotation
+    const int lsw = rotate_cw90 ? src_h : src_w;
+    const int lsh = rotate_cw90 ? src_w : src_h;
+
+    // Fill-mode center-crop in logical source space
+    int cx = 0, cy_off = 0, cw = lsw, ch = lsh;
     if (static_cast<std::int64_t>(cw) * dst_h >
         static_cast<std::int64_t>(dst_w) * ch) {
-      // src wider than dst → crop width
       cw = static_cast<int>(static_cast<std::int64_t>(ch) * dst_w / dst_h);
-      cx = (src_w - cw) / 2;
+      cx = (lsw - cw) / 2;
     } else if (static_cast<std::int64_t>(cw) * dst_h <
                static_cast<std::int64_t>(dst_w) * ch) {
-      // src taller than dst → crop height
       ch = static_cast<int>(static_cast<std::int64_t>(cw) * dst_h / dst_w);
-      cy_off = (src_h - ch) / 2;
+      cy_off = (lsh - ch) / 2;
     }
     cx    &= ~1; cy_off &= ~1; cw &= ~1; ch &= ~1;
     dst_x &= ~1; dst_y  &= ~1; dst_w &= ~1; dst_h &= ~1;
 
-    // Fixed-point scale factors (16.16)
     const std::int64_t y_scale =
         dst_h > 0 ? (static_cast<std::int64_t>(ch) << 16) / dst_h : 0;
     const std::int64_t x_scale =
         dst_w > 0 ? (static_cast<std::int64_t>(cw) << 16) / dst_w : 0;
 
-    // Y plane
-    for (int y = 0; y < dst_h; ++y) {
-      const int sy =
-          cy_off + static_cast<int>((static_cast<std::int64_t>(y) * y_scale) >> 16);
-      const std::uint8_t *src_row = src + sy * src_w;
-      std::uint8_t       *dst_row = cy + (dst_y + y) * canvas_pitch + dst_x;
-      for (int x = 0; x < dst_w; ++x) {
-        const int sx =
-            cx + static_cast<int>((static_cast<std::int64_t>(x) * x_scale) >> 16);
-        dst_row[x] = src_row[sx];
+    if (rotate_cw90) {
+      // Y plane — logical (lsx,lsy) → actual (asx=lsy, asy=src_h-1-lsx)
+      for (int y = 0; y < dst_h; ++y) {
+        const int lsy =
+            cy_off + static_cast<int>((static_cast<std::int64_t>(y) * y_scale) >> 16);
+        std::uint8_t *dst_row = cy + (dst_y + y) * canvas_pitch + dst_x;
+        for (int x = 0; x < dst_w; ++x) {
+          const int lsx =
+              cx + static_cast<int>((static_cast<std::int64_t>(x) * x_scale) >> 16);
+          dst_row[x] = src[(src_h - 1 - lsx) * src_w + lsy];
+        }
+      }
+      // UV plane — logical (lux,luy) → actual (aux=luy, auy=src_h/2-1-lux)
+      const std::int64_t uvy_scale =
+          (dst_h / 2) > 0
+              ? (static_cast<std::int64_t>(ch / 2) << 16) / (dst_h / 2)
+              : 0;
+      const std::int64_t uvx_scale =
+          (dst_w / 2) > 0
+              ? (static_cast<std::int64_t>(cw / 2) << 16) / (dst_w / 2)
+              : 0;
+      const std::uint8_t *src_uv = src + src_w * src_h;
+      for (int y = 0; y < dst_h / 2; ++y) {
+        const int luy =
+            cy_off / 2 +
+            static_cast<int>((static_cast<std::int64_t>(y) * uvy_scale) >> 16);
+        std::uint8_t *dst_row = cuv + (dst_y / 2 + y) * canvas_pitch + dst_x;
+        for (int x = 0; x < dst_w / 2; ++x) {
+          const int lux =
+              cx / 2 +
+              static_cast<int>((static_cast<std::int64_t>(x) * uvx_scale) >> 16);
+          const std::uint8_t *sp =
+              src_uv + (src_h / 2 - 1 - lux) * src_w + luy * 2;
+          dst_row[x * 2]     = sp[0];
+          dst_row[x * 2 + 1] = sp[1];
+        }
+      }
+    } else {
+      // Y plane (no rotation)
+      for (int y = 0; y < dst_h; ++y) {
+        const int sy =
+            cy_off + static_cast<int>((static_cast<std::int64_t>(y) * y_scale) >> 16);
+        const std::uint8_t *src_row = src + sy * src_w;
+        std::uint8_t       *dst_row = cy + (dst_y + y) * canvas_pitch + dst_x;
+        for (int x = 0; x < dst_w; ++x) {
+          const int sx =
+              cx + static_cast<int>((static_cast<std::int64_t>(x) * x_scale) >> 16);
+          dst_row[x] = src_row[sx];
+        }
+      }
+      // UV plane (no rotation)
+      const std::int64_t uvy_scale =
+          (dst_h / 2) > 0
+              ? (static_cast<std::int64_t>(ch / 2) << 16) / (dst_h / 2)
+              : 0;
+      const std::int64_t uvx_scale =
+          (dst_w / 2) > 0
+              ? (static_cast<std::int64_t>(cw / 2) << 16) / (dst_w / 2)
+              : 0;
+      const std::uint8_t *src_uv = src + src_w * src_h;
+      for (int y = 0; y < dst_h / 2; ++y) {
+        const int sy =
+            cy_off / 2 +
+            static_cast<int>((static_cast<std::int64_t>(y) * uvy_scale) >> 16);
+        const std::uint8_t *src_row = src_uv + sy * src_w;
+        std::uint8_t       *dst_row =
+            cuv + (dst_y / 2 + y) * canvas_pitch + dst_x;
+        for (int x = 0; x < dst_w / 2; ++x) {
+          const int sx =
+              cx / 2 +
+              static_cast<int>((static_cast<std::int64_t>(x) * uvx_scale) >> 16);
+          dst_row[x * 2]     = src_row[sx * 2];
+          dst_row[x * 2 + 1] = src_row[sx * 2 + 1];
+        }
       }
     }
-    // UV plane (chroma is half-size, interleaved U,V pairs)
-    const std::int64_t uvy_scale =
-        (dst_h / 2) > 0
-            ? (static_cast<std::int64_t>(ch / 2) << 16) / (dst_h / 2)
-            : 0;
-    const std::int64_t uvx_scale =
-        (dst_w / 2) > 0
-            ? (static_cast<std::int64_t>(cw / 2) << 16) / (dst_w / 2)
-            : 0;
-    const std::uint8_t *src_uv = src + src_w * src_h;
-    for (int y = 0; y < dst_h / 2; ++y) {
-      const int sy =
-          cy_off / 2 +
-          static_cast<int>((static_cast<std::int64_t>(y) * uvy_scale) >> 16);
-      const std::uint8_t *src_row = src_uv + sy * src_w;
-      std::uint8_t       *dst_row =
-          cuv + (dst_y / 2 + y) * canvas_pitch + dst_x;
-      for (int x = 0; x < dst_w / 2; ++x) {
-        const int sx =
-            cx / 2 +
-            static_cast<int>((static_cast<std::int64_t>(x) * uvx_scale) >> 16);
-        dst_row[x * 2]     = src_row[sx * 2];      // U
-        dst_row[x * 2 + 1] = src_row[sx * 2 + 1];  // V
-      }
+  }
+
+  // Full-screen CPU-rotated preview for local camera frames (portrait-mounted
+  // sensor outputting landscape data). Uses composite buffers so DRM plane
+  // receives a pre-rotated NV12 frame at screen resolution.
+  void renderNV12Rotated(const std::uint8_t *src, int src_w, int src_h) {
+    if (src_w < 8 || src_h < 8) return;
+    std::lock_guard<std::mutex> render_lock(render_mutex_);
+    if (!ensureCompositeBufs()) return;
+    DumbBuf &b = cbufs_[comp_next_];
+    comp_next_ ^= 1;
+
+    const std::size_t y_size = static_cast<std::size_t>(b.pitch) * screen_h_;
+    std::uint8_t *const cy_plane  = b.mapped;
+    std::uint8_t *const cuv_plane = b.mapped + y_size;
+    std::memset(cy_plane,  0x10, y_size);
+    std::memset(cuv_plane, 0x80, y_size / 2);
+
+    scaleNV12Blit(cy_plane, cuv_plane, b.pitch, screen_h_,
+                  0, 0, screen_w_, screen_h_,
+                  src, src_w, src_h, /*rotate_cw90=*/true);
+
+    if (drmModeSetPlane(fd_, plane_id_, crtc_id_, b.fb_id, 0,
+                        0, 0, screen_w_, screen_h_,
+                        0, 0, screen_w_ << 16, screen_h_ << 16) < 0) {
+      std::cerr << "[drm] SetPlane (rotated preview) failed: "
+                << std::strerror(errno) << "\n";
     }
   }
 
@@ -1119,13 +1192,15 @@ public:
       scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
                     0, 0,      screen_w_, half_h, remote, rw, rh);
       scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
-                    0, half_h, screen_w_, half_h, local,  lw, lh);
+                    0, half_h, screen_w_, half_h, local,  lw, lh,
+                    /*rotate_cw90=*/true);
     } else {
       const int half_w = screen_w_ / 2;
       scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
                     0,      0, half_w, screen_h_, remote, rw, rh);
       scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
-                    half_w, 0, half_w, screen_h_, local,  lw, lh);
+                    half_w, 0, half_w, screen_h_, local,  lw, lh,
+                    /*rotate_cw90=*/true);
     }
 
     if (drmModeSetPlane(fd_, plane_id_, crtc_id_, b.fb_id, 0,
@@ -2255,7 +2330,7 @@ int main(int argc, char *argv[]) {
             std::vector<std::uint8_t> bytes;
             while (!preview_stop.load(std::memory_order_relaxed)) {
               if (pv.dequeue(bytes, 200))
-                g_drm.renderNV12(bytes.data(), pv.width(), pv.height());
+                g_drm.renderNV12Rotated(bytes.data(), pv.width(), pv.height());
             }
           });
     }
@@ -2574,7 +2649,7 @@ int main(int argc, char *argv[]) {
         const bool no_remote = g_video_router.getActive().empty();
         if ((!g_in_meeting.load(std::memory_order_relaxed) || no_remote)
             && g_drm_ok.load())
-          g_drm.renderNV12(bytes.data(), video_w, video_h);
+          g_drm.renderNV12Rotated(bytes.data(), video_w, video_h);
 
         VideoFrame vf(video_w, video_h, VideoBufferType::NV12,
                       std::move(bytes));

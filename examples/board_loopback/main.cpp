@@ -960,10 +960,188 @@ public:
     crtc_h = snap_down_even(crtc_h);
   }
 
+  // ---- Phase 8.4.5: split-screen display layout ----
+
+  enum class DisplayLayout { Portrait, Landscape };
+  DisplayLayout displayLayout() const {
+    static const DisplayLayout m = []() {
+      const char *e = std::getenv("BOARD_DISPLAY_LAYOUT");
+      if (e && std::string(e) == "landscape") return DisplayLayout::Landscape;
+      return DisplayLayout::Portrait;
+    }();
+    return m;
+  }
+
+  // Nearest-neighbor NV12 fill-mode blit.
+  // Scales src (src_w × src_h) into the (dst_x, dst_y, dst_w, dst_h) rect of
+  // a canvas described by (cy, cuv, canvas_pitch, canvas_h).
+  // Fill mode: center-crops src to dst aspect ratio before scaling.
+  static void scaleNV12Blit(std::uint8_t *cy, std::uint8_t *cuv,
+                             int canvas_pitch, int canvas_h,
+                             int dst_x, int dst_y, int dst_w, int dst_h,
+                             const std::uint8_t *src, int src_w, int src_h) {
+    (void)canvas_h;
+    // Compute fill-mode crop window (center-crop src to dst aspect ratio)
+    int cx = 0, cy_off = 0, cw = src_w, ch = src_h;
+    if (static_cast<std::int64_t>(cw) * dst_h >
+        static_cast<std::int64_t>(dst_w) * ch) {
+      // src wider than dst → crop width
+      cw = static_cast<int>(static_cast<std::int64_t>(ch) * dst_w / dst_h);
+      cx = (src_w - cw) / 2;
+    } else if (static_cast<std::int64_t>(cw) * dst_h <
+               static_cast<std::int64_t>(dst_w) * ch) {
+      // src taller than dst → crop height
+      ch = static_cast<int>(static_cast<std::int64_t>(cw) * dst_h / dst_w);
+      cy_off = (src_h - ch) / 2;
+    }
+    cx    &= ~1; cy_off &= ~1; cw &= ~1; ch &= ~1;
+    dst_x &= ~1; dst_y  &= ~1; dst_w &= ~1; dst_h &= ~1;
+
+    // Fixed-point scale factors (16.16)
+    const std::int64_t y_scale =
+        dst_h > 0 ? (static_cast<std::int64_t>(ch) << 16) / dst_h : 0;
+    const std::int64_t x_scale =
+        dst_w > 0 ? (static_cast<std::int64_t>(cw) << 16) / dst_w : 0;
+
+    // Y plane
+    for (int y = 0; y < dst_h; ++y) {
+      const int sy =
+          cy_off + static_cast<int>((static_cast<std::int64_t>(y) * y_scale) >> 16);
+      const std::uint8_t *src_row = src + sy * src_w;
+      std::uint8_t       *dst_row = cy + (dst_y + y) * canvas_pitch + dst_x;
+      for (int x = 0; x < dst_w; ++x) {
+        const int sx =
+            cx + static_cast<int>((static_cast<std::int64_t>(x) * x_scale) >> 16);
+        dst_row[x] = src_row[sx];
+      }
+    }
+    // UV plane (chroma is half-size, interleaved U,V pairs)
+    const std::int64_t uvy_scale =
+        (dst_h / 2) > 0
+            ? (static_cast<std::int64_t>(ch / 2) << 16) / (dst_h / 2)
+            : 0;
+    const std::int64_t uvx_scale =
+        (dst_w / 2) > 0
+            ? (static_cast<std::int64_t>(cw / 2) << 16) / (dst_w / 2)
+            : 0;
+    const std::uint8_t *src_uv = src + src_w * src_h;
+    for (int y = 0; y < dst_h / 2; ++y) {
+      const int sy =
+          cy_off / 2 +
+          static_cast<int>((static_cast<std::int64_t>(y) * uvy_scale) >> 16);
+      const std::uint8_t *src_row = src_uv + sy * src_w;
+      std::uint8_t       *dst_row =
+          cuv + (dst_y / 2 + y) * canvas_pitch + dst_x;
+      for (int x = 0; x < dst_w / 2; ++x) {
+        const int sx =
+            cx / 2 +
+            static_cast<int>((static_cast<std::int64_t>(x) * uvx_scale) >> 16);
+        dst_row[x * 2]     = src_row[sx * 2];      // U
+        dst_row[x * 2 + 1] = src_row[sx * 2 + 1];  // V
+      }
+    }
+  }
+
+  // Allocate a pair of screen-sized dumb buffers for compositing.
+  bool ensureCompositeBufs() {
+    if (comp_w_ == screen_w_ && comp_h_ == screen_h_) return true;
+    freeCompositeBufs();
+    comp_w_ = screen_w_;
+    comp_h_ = screen_h_;
+    for (int i = 0; i < 2; ++i) {
+      DumbBuf &b = cbufs_[i];
+      drm_mode_create_dumb cd{};
+      cd.width  = static_cast<std::uint32_t>(screen_w_);
+      cd.height = static_cast<std::uint32_t>(screen_h_ * 3 / 2);
+      cd.bpp    = 8;
+      if (drmIoctl(fd_, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
+        std::cerr << "[drm] composite CREATE_DUMB failed: "
+                  << std::strerror(errno) << "\n";
+        return false;
+      }
+      b.handle = cd.handle;
+      b.size   = cd.size;
+      b.pitch  = cd.pitch;
+      drm_mode_map_dumb md{};
+      md.handle = b.handle;
+      if (drmIoctl(fd_, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
+        std::cerr << "[drm] composite MAP_DUMB failed: "
+                  << std::strerror(errno) << "\n";
+        return false;
+      }
+      b.mapped = static_cast<std::uint8_t *>(
+          mmap(nullptr, b.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_,
+               md.offset));
+      if (b.mapped == MAP_FAILED) {
+        std::cerr << "[drm] composite mmap failed: "
+                  << std::strerror(errno) << "\n";
+        return false;
+      }
+      std::uint32_t handles[4] = {b.handle, b.handle, 0, 0};
+      std::uint32_t pitches[4] = {b.pitch, b.pitch, 0, 0};
+      std::uint32_t offsets[4] = {
+          0,
+          b.pitch * static_cast<std::uint32_t>(screen_h_),
+          0, 0};
+      if (drmModeAddFB2(fd_, screen_w_, screen_h_, DRM_FORMAT_NV12, handles,
+                        pitches, offsets, &b.fb_id, 0) < 0) {
+        std::cerr << "[drm] composite AddFB2 failed: "
+                  << std::strerror(errno) << "\n";
+        return false;
+      }
+    }
+    std::cout << "[drm] composite buffers ready: 2x " << screen_w_ << "x"
+              << screen_h_ << " NV12\n";
+    return true;
+  }
+
+  // Composite remote + local NV12 frames into one screen-sized buffer and
+  // display it via DRM plane.
+  // Portrait layout (default): top half = remote, bottom half = local.
+  // Landscape layout: left half = remote, right half = local.
+  void renderSplitNV12(const std::uint8_t *remote, int rw, int rh,
+                       const std::uint8_t *local,  int lw, int lh) {
+    if (rw < 8 || rh < 8 || lw < 8 || lh < 8) return;
+    std::lock_guard<std::mutex> render_lock(render_mutex_);
+    if (!ensureCompositeBufs()) return;
+    DumbBuf &b = cbufs_[comp_next_];
+    comp_next_ ^= 1;
+
+    const std::size_t y_size = static_cast<std::size_t>(b.pitch) * screen_h_;
+    std::uint8_t *const cy  = b.mapped;
+    std::uint8_t *const cuv = b.mapped + y_size;
+    // BT.601 limited-range black: Y=16, UV=128
+    std::memset(cy,  0x10, y_size);
+    std::memset(cuv, 0x80, y_size / 2);
+
+    if (displayLayout() == DisplayLayout::Portrait) {
+      const int half_h = screen_h_ / 2;
+      scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
+                    0, 0,      screen_w_, half_h, remote, rw, rh);
+      scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
+                    0, half_h, screen_w_, half_h, local,  lw, lh);
+    } else {
+      const int half_w = screen_w_ / 2;
+      scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
+                    0,      0, half_w, screen_h_, remote, rw, rh);
+      scaleNV12Blit(cy, cuv, b.pitch, screen_h_,
+                    half_w, 0, half_w, screen_h_, local,  lw, lh);
+    }
+
+    if (drmModeSetPlane(fd_, plane_id_, crtc_id_, b.fb_id, 0,
+                        0, 0, screen_w_, screen_h_,
+                        0, 0,
+                        screen_w_ << 16, screen_h_ << 16) < 0) {
+      std::cerr << "[drm] SetPlane (split) failed: "
+                << std::strerror(errno) << "\n";
+    }
+  }
+
   ~DrmDisplay() { close(); }
 
   void close() {
     freeBuffers();
+    freeCompositeBufs();
     if (fd_ >= 0) {
       drmDropMaster(fd_);
       ::close(fd_);
@@ -1005,6 +1183,26 @@ private:
     buf_w_ = buf_h_ = 0;
   }
 
+  void freeCompositeBufs() {
+    for (auto &b : cbufs_) {
+      if (b.fb_id) {
+        drmModeRmFB(fd_, b.fb_id);
+        b.fb_id = 0;
+      }
+      if (b.mapped && b.mapped != MAP_FAILED) {
+        munmap(b.mapped, b.size);
+        b.mapped = nullptr;
+      }
+      if (b.handle) {
+        drm_mode_destroy_dumb dd{};
+        dd.handle = b.handle;
+        drmIoctl(fd_, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+        b.handle = 0;
+      }
+    }
+    comp_w_ = comp_h_ = 0;
+  }
+
   struct DumbBuf {
     std::uint32_t handle = 0;
     std::uint32_t fb_id = 0;
@@ -1024,6 +1222,11 @@ private:
   int next_ = 0;
   int buf_w_ = 0;
   int buf_h_ = 0;
+  // Phase 8.4.5: screen-sized composite buffers for split-screen rendering
+  DumbBuf cbufs_[2];
+  int comp_next_ = 0;
+  int comp_w_    = 0;
+  int comp_h_    = 0;
   // Phase 8.4.1：保护 ensureBuffers 的 free/realloc 临界区，防多 peer
   // 并发 callback use-after-free。
   std::mutex render_mutex_;
@@ -1031,6 +1234,14 @@ private:
 
 static DrmDisplay g_drm;
 static std::atomic<bool> g_drm_ok{false};
+
+// Phase 8.4.5: local camera frame stash (updated every V4L2 frame, read by
+// VideoRouter to composite the split-screen local half).
+static std::atomic<bool>    g_in_meeting{false};
+static std::mutex            g_local_frame_mu;
+static std::vector<std::uint8_t> g_local_frame_data;
+static int g_local_frame_w = 0;
+static int g_local_frame_h = 0;
 
 // VideoRouter — Phase 8.4.1
 // ---------------------------------------------------------------
@@ -1056,7 +1267,25 @@ public:
     }
     if (!match)
       return;
-    g_drm.renderNV12(data, w, h);
+    // Phase 8.4.5: split-screen — composite remote + local frames
+    if (g_in_meeting.load(std::memory_order_relaxed)) {
+      std::vector<std::uint8_t> local_copy;
+      int lw = 0, lh = 0;
+      {
+        std::lock_guard<std::mutex> lk(g_local_frame_mu);
+        if (!g_local_frame_data.empty()) {
+          local_copy = g_local_frame_data;
+          lw = g_local_frame_w;
+          lh = g_local_frame_h;
+        }
+      }
+      if (lw > 0 && lh > 0)
+        g_drm.renderSplitNV12(data, w, h, local_copy.data(), lw, lh);
+      else
+        g_drm.renderNV12(data, w, h); // fallback: no local frame yet
+    } else {
+      g_drm.renderNV12(data, w, h);
+    }
   }
 
   // 设置 active peer id；空字符串表示无 active（下一个进来的 peer 会
@@ -2020,6 +2249,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "[loopback] failed to connect, returning to idle\n";
     room.reset();
     teardownFfiAndApm(); // 失败也要拆 FFI，下次 setupFfiAndApm 才有干净状态
+    g_in_meeting.store(false); // Phase 8.4.5: back to preview mode
     g_meeting_state.clearMeeting();
     continue; // 不退 daemon，回外循环等下次 /join
   }
@@ -2031,6 +2261,7 @@ int main(int argc, char *argv[]) {
   // Phase 8.4.4: 状态切到 InMeeting，让 GET /status 能 report room_name +
   // 通过 Room 指针拿 participant_count。
   g_meeting_state.setInMeeting(room->room_info().name, room.get());
+  g_in_meeting.store(true); // Phase 8.4.5: switch VideoRouter to split-screen
 
   // Phase 8.4.2: 起 MeetingController，将 SDK delegate 投来的 active
   // speaker / track published 事件串行 reconcile（避免多 delegate 线程
@@ -2288,6 +2519,17 @@ int main(int argc, char *argv[]) {
       // Real V4L2 capture — pull next NV12 frame from rkisp_mainpath
       std::vector<std::uint8_t> bytes;
       if (v4l2->dequeue(bytes, /*timeout_ms=*/200)) {
+        // Phase 8.4.5: stash a copy for the local half of split-screen
+        {
+          std::lock_guard<std::mutex> lk(g_local_frame_mu);
+          g_local_frame_data = bytes;
+          g_local_frame_w    = video_w;
+          g_local_frame_h    = video_h;
+        }
+        // Phase 8.4.5: show local camera preview before joining a meeting
+        if (!g_in_meeting.load(std::memory_order_relaxed) && g_drm_ok.load())
+          g_drm.renderNV12(bytes.data(), video_w, video_h);
+
         VideoFrame vf(video_w, video_h, VideoBufferType::NV12,
                       std::move(bytes));
         video_source->captureFrame(std::move(vf));
@@ -2356,6 +2598,7 @@ int main(int argc, char *argv[]) {
   g_meeting_controller.reset();
   // Phase 8.4.4: 先清掉 MeetingState 的 Room 指针（否则 status endpoint
   // 拿到悬垂指针），然后再 reset Room。
+  g_in_meeting.store(false); // Phase 8.4.5: back to local preview mode
   g_meeting_state.clearMeeting();
   // Drop tracks first
   audio_track.reset();

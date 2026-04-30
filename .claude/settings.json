@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit -m ' *)",
+      "Bash(scp d:/workspace/Meeting/livekit-sdk-cpp-0.3.3/examples/board_loopback/main.cpp rv1126b-vm:~/livekit/livekit-sdk-cpp-0.3.3/examples/board_loopback/main.cpp)",
+      "Bash(scp rv1126b-vm:~/livekit/livekit-sdk-cpp-0.3.3/build-rv1126b/bin/BoardLoopback rv1126b-board:/opt/livekit/BoardLoopback)",
+      "Bash(echo \"exit $?\")"
+    ]
+  }
+}

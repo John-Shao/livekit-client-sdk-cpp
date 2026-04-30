@@ -2219,13 +2219,56 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // Phase 8.4.5: pre-compute V4L2 device + resolution for the idle preview
+  // thread. These values come from env vars that don't change after startup.
+  const bool preview_synth = (std::getenv("BOARD_LOOPBACK_SYNTH_VIDEO") != nullptr);
+  const std::string preview_v4l2_dev = []{
+    const char *e = std::getenv("V4L2_DEVICE");
+    return (e && *e) ? std::string(e) : std::string("/dev/video-camera0");
+  }();
+  VideoResolution preview_res = kDefaultRes;
+  if (const char *e = std::getenv("BOARD_LOOPBACK_VIDEO_RES")) {
+    std::string s(e);
+    for (auto &c : s) c = static_cast<char>(std::tolower(c));
+    if      (s == "sd")  preview_res = kResSD;
+    else if (s == "hd")  preview_res = kResHD;
+    else if (s == "fhd") preview_res = kResFHD;
+  }
+
   while (true) {
     if (g_meeting_state.isShutdown())
       break;
+
+    // Phase 8.4.5: idle preview — capture local camera and show on screen
+    // while waiting for next /join. The thread stops and releases V4L2 before
+    // the meeting body opens its own V4l2Capture instance.
+    std::atomic<bool> preview_stop{false};
+    std::thread preview_thread;
+    if (!preview_synth && g_drm_ok.load()) {
+      preview_thread = std::thread(
+          [&preview_stop, preview_v4l2_dev, preview_res]() {
+            V4l2Capture pv;
+            if (!pv.open(preview_v4l2_dev.c_str(), preview_res.width,
+                         preview_res.height, preview_res.fps) ||
+                !pv.startStream())
+              return;
+            std::vector<std::uint8_t> bytes;
+            while (!preview_stop.load(std::memory_order_relaxed)) {
+              if (pv.dequeue(bytes, 200))
+                g_drm.renderNV12(bytes.data(), pv.width(), pv.height());
+            }
+          });
+    }
+
     std::cout << "[daemon] waiting for HTTP /v1/meeting/join "
                  "(POST to 0.0.0.0:"
               << api_port << " with Bearer auth) or SIGINT/SIGTERM...\n";
     auto join_or = g_meeting_state.waitForJoinOrShutdown();
+
+    // Stop idle preview before the meeting body opens V4L2.
+    preview_stop.store(true);
+    if (preview_thread.joinable()) preview_thread.join();
+
     if (!join_or) {
       std::cout << "[daemon] shutdown requested, exiting outer loop\n";
       break;
@@ -2526,8 +2569,11 @@ int main(int argc, char *argv[]) {
           g_local_frame_w    = video_w;
           g_local_frame_h    = video_h;
         }
-        // Phase 8.4.5: show local camera preview before joining a meeting
-        if (!g_in_meeting.load(std::memory_order_relaxed) && g_drm_ok.load())
+        // Phase 8.4.5: show local camera preview when not in meeting OR
+        // when in meeting but no remote peer is active (peer disconnected).
+        const bool no_remote = g_video_router.getActive().empty();
+        if ((!g_in_meeting.load(std::memory_order_relaxed) || no_remote)
+            && g_drm_ok.load())
           g_drm.renderNV12(bytes.data(), video_w, video_h);
 
         VideoFrame vf(video_w, video_h, VideoBufferType::NV12,

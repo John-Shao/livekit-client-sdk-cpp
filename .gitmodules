@@ -3,4 +3,4 @@
 	url = https://github.com/John-Shao/livekit-sdk-rust.git
 [submodule "cpp-example-collection"]
 	path = cpp-example-collection
-	url = https://github.com/livekit-examples/cpp-example-collection.git
+	url = https://github.com/John-Shao/livekit-cpp-examples.git
